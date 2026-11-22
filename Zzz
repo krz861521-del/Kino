@@ -1,0 +1,591 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local LP = Players.LocalPlayer
+
+if getgenv and getgenv().BlueHub then
+    pcall(function() getgenv().BlueHub.stop() end)
+end
+
+local Hub = { conns = {}, alive = true }
+print("[BlueHub] iniciando...")
+
+--==========================================================================
+-- MÓDULO: AUTO DRIBLEO
+--==========================================================================
+local Dribble = {
+    cfg = {
+        TriggerName = "Sliding",
+        DribbleName = "Dribbling",
+        Range = 15,
+        FacingDot = 0.5,
+        Cooldown = 0.8,
+        ReactionDelay = 0.05,
+        DribbleKey = Enum.KeyCode.Q,
+        RemoteArgs = {},
+        IgnoreTeammates = true,
+    },
+    conn = nil, active = {}, last = 0, remote = nil, button = nil,
+}
+
+local function dFindRemote()
+    if Dribble.remote and Dribble.remote.Parent then return Dribble.remote end
+    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+        if (d:IsA("RemoteEvent") or d:IsA("RemoteFunction")) and d.Name == Dribble.cfg.DribbleName then
+            Dribble.remote = d
+            return d
+        end
+    end
+end
+
+local function dFindButton()
+    if Dribble.button and Dribble.button.Parent then return Dribble.button end
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if d:IsA("GuiButton") and d.Name == Dribble.cfg.DribbleName then
+            Dribble.button = d
+            return d
+        end
+    end
+end
+
+local function dPress(btn)
+    if not getconnections then return false end
+    local fired = false
+    for _, sig in ipairs({ btn.MouseButton1Down, btn.MouseButton1Click, btn.MouseButton1Up, btn.Activated, btn.TouchTap }) do
+        pcall(function()
+            for _, c in ipairs(getconnections(sig)) do
+                c:Fire()
+                fired = true
+            end
+        end)
+    end
+    return fired
+end
+
+local function dDribble()
+    local cfg = Dribble.cfg
+    local remote = dFindRemote()
+    if remote then
+        local ok = pcall(function()
+            if remote:IsA("RemoteEvent") then
+                remote:FireServer(table.unpack(cfg.RemoteArgs))
+            else
+                remote:InvokeServer(table.unpack(cfg.RemoteArgs))
+            end
+        end)
+        if ok then return end
+    end
+
+    local btn = dFindButton()
+    if btn and dPress(btn) then return end
+
+    local ok, vim = pcall(function() return game:GetService("VirtualInputManager") end)
+    if ok and vim then
+        vim:SendKeyEvent(true, cfg.DribbleKey, false, game)
+        task.delay(0.05, function()
+            vim:SendKeyEvent(false, cfg.DribbleKey, false, game)
+        end)
+    end
+end
+
+local function dTrigger()
+    if os.clock() - Dribble.last < Dribble.cfg.Cooldown then return end
+    Dribble.last = os.clock()
+    task.delay(Dribble.cfg.ReactionDelay, dDribble)
+end
+
+local function dIsTrigger(track)
+    local a = track.Animation
+    local wanted = string.lower(Dribble.cfg.TriggerName)
+    for _, n in ipairs({ track.Name, a and a.Name or "" }) do
+        if n ~= "" and string.find(string.lower(n), wanted, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function dFacing(root, toMe)
+    local flat = Vector3.new(toMe.X, 0, toMe.Z)
+    if flat.Magnitude < 0.05 then return true end
+    local look = root.CFrame.LookVector
+    look = Vector3.new(look.X, 0, look.Z)
+    if look.Magnitude < 0.05 then return false end
+    return look.Unit:Dot(flat.Unit) >= Dribble.cfg.FacingDot
+end
+
+local function dStep()
+    local myRoot = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return end
+    local cfg = Dribble.cfg
+    local nowActive = {}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        local sameTeam = cfg.IgnoreTeammates and player.Team and player.Team == LP.Team
+        if player ~= LP and not sameTeam then
+            local char = player.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            local animator = hum and hum:FindFirstChildOfClass("Animator")
+
+            if root and animator then
+                local toMe = myRoot.Position - root.Position
+                if toMe.Magnitude <= cfg.Range then
+                    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                        if dIsTrigger(track) then
+                            nowActive[track] = true
+                            if not Dribble.active[track] and dFacing(root, toMe) then
+                                dTrigger()
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    Dribble.active = nowActive
+end
+
+function Dribble.enable()
+    Dribble.active = {}
+    Dribble.conn = RunService.Heartbeat:Connect(dStep)
+end
+
+function Dribble.disable()
+    if Dribble.conn then Dribble.conn:Disconnect() Dribble.conn = nil end
+    Dribble.active = {}
+end
+
+--==========================================================================
+-- MÓDULO: AUTO SAVE (portero)
+--==========================================================================
+local Save = {
+    cfg = { Cooldown = 2.4, MinSpeed = 18, Range = 75 },
+    conn = nil, charConn = nil, diveConn = nil, bv = nil,
+    humanoid = nil, rootPart = nil,
+    DiveRemote = nil, StaminaRemote = nil, MovementAnims = nil,
+    animTracks = {}, lastDive = 0,
+    diving = false, ready = false, enabled = false,
+}
+
+local GOAL_WIDTH = 48
+local GOAL_HEIGHT = 29
+local DIVE_SPEED = 65.2
+local DECEL_VAL = 37
+local GROUND_VERTICAL = 35
+local GROUND_GRAVITY = 130
+local AIR_DIVE_MIN = 75
+local AIR_DIVE_MAX = 85
+local AIR_GRAVITY = 300
+local NUDGE_DURATION = 0.55
+local REL_VEL_Z_MIN = 1.5
+
+local function getBall()
+    local f = workspace:FindFirstChild("Football")
+    if f then
+        local part = f:FindFirstChild("Hitbox") or f:FindFirstChild("BALL") or f:FindFirstChildWhichIsA("BasePart")
+        if part then return part end
+        if f:IsA("BasePart") then return f end
+    end
+    return nil
+end
+
+local function saveSetup()
+    local char = LP.Character or LP.CharacterAdded:Wait()
+    Save.humanoid = char:WaitForChild("Humanoid")
+    Save.rootPart = char:WaitForChild("HumanoidRootPart")
+
+    local ok, err = pcall(function()
+        local services = ReplicatedStorage:WaitForChild("Packages", 5):WaitForChild("Knit", 5):WaitForChild("Services", 5)
+        Save.DiveRemote = services:WaitForChild("BallService", 5):WaitForChild("RE", 5):WaitForChild("Dive", 5)
+        Save.StaminaRemote = services:WaitForChild("StaminaService", 5):WaitForChild("RE", 5):WaitForChild("DecreaseStamina", 5)
+        Save.MovementAnims = ReplicatedStorage:WaitForChild("Assets", 5):WaitForChild("ReplicatedAnims", 5):WaitForChild("Movement", 5)
+    end)
+    if not ok then return false, err end
+
+    Save.animTracks = {}
+    for _, name in ipairs({ "DiveL", "DiveR", "DiveF" }) do
+        local anim = Save.MovementAnims:FindFirstChild(name)
+        if anim then
+            Save.animTracks[name] = Save.humanoid:LoadAnimation(anim)
+        end
+    end
+    return true
+end
+
+local function isBallHeadingIntoGoal(ball)
+    local rootPart = Save.rootPart
+    if not rootPart then return false end
+    local vel = ball.AssemblyLinearVelocity
+    if vel.Magnitude < Save.cfg.MinSpeed then return false end
+
+    local relVel = rootPart.CFrame:VectorToObjectSpace(vel)
+    local relPos = rootPart.CFrame:PointToObjectSpace(ball.Position)
+
+    if relVel.Z <= REL_VEL_Z_MIN then return false end
+
+    local timeToGoal = math.abs(relPos.Z / relVel.Z)
+    if timeToGoal > 3.5 then return false end
+
+    local predictedX = relPos.X + (relVel.X * timeToGoal)
+    local predictedY = ball.Position.Y + (vel.Y * timeToGoal) + (0.5 * -workspace.Gravity * timeToGoal ^ 2)
+
+    return math.abs(predictedX) < (GOAL_WIDTH / 2)
+        and predictedY > 0
+        and predictedY < GOAL_HEIGHT
+end
+
+local function performDive(ball)
+    local rootPart, humanoid = Save.rootPart, Save.humanoid
+    if Save.diving or not rootPart or not humanoid or not Save.DiveRemote then return end
+    local now = tick()
+    if now - Save.lastDive < Save.cfg.Cooldown then return end
+
+    Save.diving = true
+    Save.lastDive = now
+
+    local vel = ball.AssemblyLinearVelocity
+    local relVel = rootPart.CFrame:VectorToObjectSpace(vel)
+    local relPos = rootPart.CFrame:PointToObjectSpace(ball.Position)
+
+    local pTime = math.clamp(math.abs(relPos.Z / math.max(math.abs(relVel.Z), 0.5)), 0.01, 1.5)
+    local targetPos = ball.Position + (vel * pTime) + (0.5 * Vector3.new(0, -workspace.Gravity, 0) * pTime ^ 2)
+
+    local currentRelY = ball.Position.Y - rootPart.Position.Y
+    local predictedRelY = targetPos.Y - rootPart.Position.Y
+    local isAirShot = (predictedRelY > 4) or (currentRelY > 4)
+
+    local rel = rootPart.CFrame:PointToObjectSpace(targetPos)
+    local animName, dirKey, velX
+    if rel.X > 0 then
+        animName, dirKey, velX = "DiveR", "r", DIVE_SPEED
+    else
+        animName, dirKey, velX = "DiveL", "l", -DIVE_SPEED
+    end
+
+    local diveVertical = isAirShot
+        and math.clamp(AIR_DIVE_MIN + (math.max(currentRelY, predictedRelY) * 2.5), AIR_DIVE_MIN, AIR_DIVE_MAX)
+        or GROUND_VERTICAL
+    local currentGravity = isAirShot and AIR_GRAVITY or GROUND_GRAVITY
+
+    pcall(function() Save.StaminaRemote:FireServer(10) end)
+    pcall(function() Save.DiveRemote:FireServer(targetPos, pTime, dirKey) end)
+
+    local track = Save.animTracks[animName]
+    if track then
+        track.Priority = Enum.AnimationPriority.Action4
+        track:Play(0, 1, 1.4)
+    end
+
+    humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+    pcall(function() rootPart:SetNetworkOwner(LP) end)
+
+    if Save.diveConn then Save.diveConn:Disconnect() Save.diveConn = nil end
+    if Save.bv then pcall(function() Save.bv:Destroy() end) end
+
+    local bv = Instance.new("BodyVelocity")
+    bv.MaxForce = Vector3.new(1, 1, 1) * 2500000
+    bv.Parent = rootPart
+    Save.bv = bv
+
+    local initialWorldMove = rootPart.CFrame:VectorToWorldSpace(Vector3.new(velX, 0, 0))
+    rootPart.AssemblyLinearVelocity = initialWorldMove + Vector3.new(0, diveVertical, 0)
+
+    local startTime = tick()
+    local currentVelX = velX
+    local currentVelV = diveVertical
+
+    Save.diveConn = RunService.Heartbeat:Connect(function(dt)
+        if not rootPart or not bv or not bv.Parent then
+            if Save.diveConn then Save.diveConn:Disconnect() Save.diveConn = nil end
+            Save.diving = false
+            return
+        end
+
+        local elapsed = tick() - startTime
+        if elapsed > NUDGE_DURATION then
+            bv:Destroy()
+            Save.bv = nil
+            local v = rootPart.AssemblyLinearVelocity
+            rootPart.AssemblyLinearVelocity = Vector3.new(v.X * 0.25, math.min(v.Y, -14), v.Z * 0.25)
+            humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+            if Save.diveConn then Save.diveConn:Disconnect() Save.diveConn = nil end
+            Save.diving = false
+            return
+        end
+
+        local worldMove = rootPart.CFrame:VectorToWorldSpace(Vector3.new(currentVelX, 0, 0))
+        bv.Velocity = worldMove + Vector3.new(0, currentVelV, 0)
+
+        if elapsed > 0.08 then
+            currentVelX = currentVelX - (dt * (currentVelX > 0 and DECEL_VAL or -DECEL_VAL))
+        end
+        currentVelV = currentVelV - (dt * currentGravity)
+    end)
+end
+
+local function saveStep()
+    local rootPart = Save.rootPart
+    if not Save.ready or Save.diving or not rootPart or not rootPart.Parent then return end
+
+    local ball = getBall()
+    if not ball then return end
+
+    if (ball.Position - rootPart.Position).Magnitude > Save.cfg.Range then return end
+
+    if isBallHeadingIntoGoal(ball) then
+        performDive(ball)
+    end
+end
+
+function Save.enable(fail)
+    Save.enabled = true
+    Save.ready = false
+
+    task.spawn(function()
+        local ok, err = saveSetup()
+        if not Save.enabled then return end
+        if not ok then
+            warn("[BlueHub] Auto Save:", err)
+            if fail then fail("Auto Save: no encontré los remotes del juego") end
+            return
+        end
+        Save.ready = true
+    end)
+
+    Save.charConn = LP.CharacterAdded:Connect(function()
+        Save.ready = false
+        task.wait(0.5)
+        if not Save.enabled then return end
+        local ok = saveSetup()
+        Save.ready = ok and Save.enabled
+    end)
+
+    Save.conn = RunService.Heartbeat:Connect(saveStep)
+end
+
+function Save.disable()
+    Save.enabled = false
+    Save.ready = false
+    if Save.conn then Save.conn:Disconnect() Save.conn = nil end
+    if Save.charConn then Save.charConn:Disconnect() Save.charConn = nil end
+    if Save.diveConn then Save.diveConn:Disconnect() Save.diveConn = nil end
+    if Save.bv then
+        pcall(function() Save.bv:Destroy() end)
+        Save.bv = nil
+        pcall(function() Save.humanoid:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+    end
+    Save.diving = false
+end
+
+--==========================================================================
+-- MÓDULO: STAMINA INFINITA
+--==========================================================================
+local Stamina = { conn = nil, charConn = nil, on = false }
+
+local function staminaHook(fail)
+    local stats = LP:FindFirstChild("PlayerStats") or LP:WaitForChild("PlayerStats", 10)
+    local stam = stats and (stats:FindFirstChild("Stamina") or stats:WaitForChild("Stamina", 5))
+    if not stam then
+        if fail then fail("Stamina: no encontré PlayerStats") end
+        return
+    end
+    if not Stamina.on then return end
+
+    if Stamina.conn then Stamina.conn:Disconnect() end
+    stam.Value = 100
+    Stamina.conn = stam:GetPropertyChangedSignal("Value"):Connect(function()
+        if stam.Value < 95 then stam.Value = 100 end
+    end)
+end
+
+function Stamina.enable(fail)
+    Stamina.on = true
+    task.spawn(staminaHook, fail)
+    Stamina.charConn = LP.CharacterAdded:Connect(function()
+        task.wait(1.5)
+        if Stamina.on then staminaHook() end
+    end)
+end
+
+function Stamina.disable()
+    Stamina.on = false
+    if Stamina.conn then Stamina.conn:Disconnect() Stamina.conn = nil end
+    if Stamina.charConn then Stamina.charConn:Disconnect() Stamina.charConn = nil end
+end
+
+print("[BlueHub] módulos listos")
+
+--==========================================================================
+-- INTERFAZ
+--==========================================================================
+local options = {
+    { key = "dribble", name = "Auto Dribleo",     desc = "Regatea cuando te hacen Sliding", module = Dribble },
+    { key = "save",    name = "Auto Save",        desc = "Portero: se lanza a los tiros",   module = Save },
+    { key = "stamina", name = "Stamina infinita", desc = "Mantiene la stamina en 100",      module = Stamina },
+}
+
+local gui = nil
+
+-- Prueba varios lugares hasta que la interfaz quede realmente dentro del juego
+local function mountGui(g)
+    local candidates = {
+        function() return LP:WaitForChild("PlayerGui", 5) end,
+        function() return gethui and gethui() end,
+        function() return game:GetService("CoreGui") end,
+    }
+    for _, getParent in ipairs(candidates) do
+        local ok, parent = pcall(getParent)
+        if ok and parent then
+            local ok2 = pcall(function() g.Parent = parent end)
+            if ok2 and g.Parent == parent then
+                return parent
+            end
+        end
+    end
+    return nil
+end
+
+function Hub.stop()
+    Hub.alive = false
+    for _, opt in ipairs(options) do
+        pcall(opt.module.disable)
+    end
+    for _, c in ipairs(Hub.conns) do pcall(function() c:Disconnect() end) end
+    if gui then pcall(function() gui:Destroy() end) end
+    if getgenv then getgenv().BlueHub = nil end
+    print("[BlueHub] cerrado")
+end
+
+local function buildUi()
+    local BG        = Color3.fromRGB(22, 24, 32)
+    local ROW       = Color3.fromRGB(34, 37, 50)
+    local ACCENT    = Color3.fromRGB(70, 130, 255)
+    local ON_COLOR  = Color3.fromRGB(60, 190, 110)
+    local OFF_COLOR = Color3.fromRGB(75, 78, 95)
+    local TEXT      = Color3.fromRGB(240, 240, 245)
+    local SUBTEXT   = Color3.fromRGB(150, 155, 175)
+
+    local function corner(inst, r)
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, r)
+        c.Parent = inst
+    end
+
+    local function stroke(inst, color)
+        local s = Instance.new("UIStroke")
+        s.Color = color
+        s.Thickness = 1
+        s.Parent = inst
+    end
+
+    gui = Instance.new("ScreenGui")
+    gui.Name = "BlueHub"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 999
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    local WIDTH, TITLE_H, ROW_H, GAP, STATUS_H = 250, 38, 42, 4, 20
+    local expandedH = TITLE_H + 8 + #options * (ROW_H + GAP) + STATUS_H + 8
+
+    local main = Instance.new("Frame")
+    main.Name = "Main"
+    main.Size = UDim2.fromOffset(WIDTH, expandedH)
+    main.Position = UDim2.new(0.5, -WIDTH / 2, 0, 70)
+    main.BackgroundColor3 = BG
+    main.BorderSizePixel = 0
+    main.Active = true
+    main.ClipsDescendants = true
+    main.Parent = gui
+    corner(main, 10)
+    stroke(main, ACCENT)
+
+    local title = Instance.new("Frame")
+    title.Size = UDim2.new(1, 0, 0, TITLE_H)
+    title.BackgroundColor3 = ROW
+    title.BorderSizePixel = 0
+    title.Active = true
+    title.Parent = main
+    corner(title, 10)
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Position = UDim2.fromOffset(12, 0)
+    titleLabel.Size = UDim2.new(1, -80, 1, 0)
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 15
+    titleLabel.TextColor3 = TEXT
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Text = "Blue Hub"
+    titleLabel.Parent = title
+
+    local function titleButton(text, offsetX)
+        local b = Instance.new("TextButton")
+        b.AnchorPoint = Vector2.new(1, 0.5)
+        b.Position = UDim2.new(1, offsetX, 0.5, 0)
+        b.Size = UDim2.fromOffset(28, 26)
+        b.BackgroundColor3 = OFF_COLOR
+        b.AutoButtonColor = false
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 16
+        b.TextColor3 = TEXT
+        b.Text = text
+        b.Parent = title
+        corner(b, 6)
+        return b
+    end
+
+    local closeBtn = titleButton("X", -6)
+    local minBtn = titleButton("-", -40)
+
+    local body = Instance.new("Frame")
+    body.Position = UDim2.fromOffset(0, TITLE_H)
+    body.Size = UDim2.new(1, 0, 1, -TITLE_H)
+    body.BackgroundTransparency = 1
+    body.Parent = main
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop = UDim.new(0, 8)
+    pad.PaddingLeft = UDim.new(0, 8)
+    pad.PaddingRight = UDim.new(0, 8)
+    pad.PaddingBottom = UDim.new(0, 8)
+    pad.Parent = body
+
+    local list = Instance.new("UIListLayout")
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.Padding = UDim.new(0, GAP)
+    list.Parent = body
+
+    local status = Instance.new("TextLabel")
+    status.LayoutOrder = 100
+    status.BackgroundTransparency = 1
+    status.Size = UDim2.new(1, 0, 0, STATUS_H)
+    status.Font = Enum.Font.Gotham
+    status.TextSize = 11
+    status.TextColor3 = SUBTEXT
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.TextTruncate = Enum.TextTruncate.AtEnd
+    status.Text = "Listo"
+    status.Parent = body
+
+    local function notify(text)
+        status.Text = text
+    end
+
+    local setters = {}
+
+    for i, opt in ipairs(options) do
+        local row = Instance.new("Frame")
+        row.LayoutOrder = i
+        row.Size = UDim2.new(1, 0, 0, ROW_H)
+        row.BackgroundColor3 = ROW
+        row.BorderSizePixel = 0
+        row.Parent = body
+        corner(row, 8)
+
+  
