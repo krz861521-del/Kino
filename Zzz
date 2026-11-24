@@ -1,3 +1,4 @@
+local BASE = "https://raw.githubusercontent.com/krz861521-del/Kino/refs/heads/main/"
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
