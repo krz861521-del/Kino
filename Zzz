@@ -1,575 +1,990 @@
--- AutoShot v7
--- Tú pateas normal (con animación) y el tiro se desvía a un punto
--- aleatorio de la portería. ON/OFF con el botón o con la tecla K.
-
 local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
-local TweenService = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
-local Debris = game:GetService("Debris")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
 
-if getgenv and getgenv().AutoShot then
-    pcall(function() getgenv().AutoShot.stop() end)
+if getgenv and getgenv().AutoDribble then
+    pcall(function() getgenv().AutoDribble.stop() end)
 end
 
 local Config = {
-    Enabled        = true,
-    Mode           = "Both",  -- "Aim": gira personaje+cámara hacia el punto antes de que salga el tiro
-                              -- "Redirect": desvía la pelota después del tiro (solo si la controlas tú)
-                              -- "Both": las dos cosas (recomendado)
-    GoalRange      = 70,      -- distancia máx a la portería (studs)
-    MinGoalRange   = 3,
-    BallRange      = 14,      -- la pelota debe estar cerca de ti
-    RequireBall    = true,
-    FacingDot      = -1,      -- -1 = patees hacia donde patees | 0 = portería al frente | 0.5 = estricto
-    HorizMargin    = 0.12,    -- evita los postes
-    HeightMin      = 0.15,    -- solo Redirect: altura mínima (0 piso, 1 travesaño)
-    HeightMax      = 0.85,
-    AimDelay       = 0.12,    -- espera para que el servidor reciba tu nueva orientación
-    AlsoTurnCamera = true,    -- gira también la cámara (muchos juegos orientan al personaje con la cámara)
-    PowerOverride  = false,   -- poner 110 para forzar potencia máxima
-    RedirectDelay  = 0.05,
-    CompensateGravity = true,
-    DefaultGoalWidth = 24,    -- si no se puede medir la portería
-    MaxGoalWidth   = 45,
-    ToggleKey      = Enum.KeyCode.K,
-    ShowButton     = true,
-    ShowMarker     = false,   -- punto rojo donde apunta (para probar)
-    Debug          = true,
+    TriggerName = "Sliding",     -- animación del rival que activa el regate
+    DribbleName = "Dribbling",   -- nombre del remote o botón del regate
+    Range = 15,                  -- distancia máxima del rival (studs)
+    FacingDot = 0.5,             -- 0.5 = apunta hacia ti (~60°). 0.8 = más estricto
+    Cooldown = 0.8,              -- segundos entre regates
+    ReactionDelay = 0.05,        -- espera antes de regatear
+    DribbleKey = Enum.KeyCode.Q, -- tecla si no hay remote ni botón
+    RemoteArgs = {},             -- argumentos si el remote los pide
+    IgnoreTeammates = true,
+    Debug = true,
 }
 
 local running = true
-local conns = {}
-local bypass = false
-local shotsSeen = 0
-local hookInstalled = false
-local gui
+local active = {}
+local lastDribble = 0
+local seenNames = {}
+local remoteCache, buttonCache
 
 local function log(...)
-    if Config.Debug then print("[AutoShot]", ...) end
+    if Config.Debug then print("[AutoDribble]", ...) end
 end
 
--- ========== REMOTE ==========
-
-local ShootRemote
-
-local function resolveRemote()
-    local ok, re = pcall(function()
-        return ReplicatedStorage.Packages.Knit.Services.BallService.RE
-    end)
-    if ok and re then ShootRemote = re:FindFirstChild("Shoot") end
-    if not ShootRemote then
-        for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
-            if d:IsA("RemoteEvent") and d.Name == "Shoot" then
-                ShootRemote = d
-                break
-            end
+local function findRemote()
+    if remoteCache and remoteCache.Parent then return remoteCache end
+    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+        if (d:IsA("RemoteEvent") or d:IsA("RemoteFunction")) and d.Name == Config.DribbleName then
+            remoteCache = d
+            return d
         end
     end
 end
-resolveRemote()
 
-local function isShoot(inst)
-    if inst == ShootRemote then return true end
-    return typeof(inst) == "Instance" and inst.ClassName == "RemoteEvent" and inst.Name == "Shoot"
+local function findButton()
+    if buttonCache and buttonCache.Parent then return buttonCache end
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    if not pg then return end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if d:IsA("GuiButton") and d.Name == Config.DribbleName then
+            buttonCache = d
+            return d
+        end
+    end
 end
 
--- ========== PORTERÍAS (con tamaño) ==========
+local function pressButton(btn)
+    if not getconnections then return false end
+    local fired = false
+    for _, sig in ipairs({ btn.MouseButton1Down, btn.MouseButton1Click, btn.MouseButton1Up, btn.Activated, btn.TouchTap }) do
+        pcall(function()
+            for _, c in ipairs(getconnections(sig)) do
+                c:Fire()
+                fired = true
+            end
+        end)
+    end
+    return fired
+end
 
-local KEYWORDS = { "goal", "net", "post", "arco", "porter" }
-local goals = {}
-local manualGoals = false
-local scanTries = 0
-local ownGoal
+local function dribble()
+    -- 1) Remote
+    local remote = findRemote()
+    if remote then
+        local ok = pcall(function()
+            if remote:IsA("RemoteEvent") then
+                remote:FireServer(table.unpack(Config.RemoteArgs))
+            else
+                remote:InvokeServer(table.unpack(Config.RemoteArgs))
+            end
+        end)
+        if ok then
+            log("Dribbling vía remote:", remote:GetFullName())
+            return
+        end
+    end
 
-local function nameMatches(name)
-    name = name:lower()
-    for _, k in ipairs(KEYWORDS) do
-        if name:find(k, 1, true) then return true end
+    -- 2) Botón en pantalla
+    local btn = findButton()
+    if btn and pressButton(btn) then
+        log("Dribbling vía botón:", btn:GetFullName())
+        return
+    end
+
+    -- 3) Tecla
+    local ok, vim = pcall(function() return game:GetService("VirtualInputManager") end)
+    if ok and vim then
+        vim:SendKeyEvent(true, Config.DribbleKey, false, game)
+        task.delay(0.05, function()
+            vim:SendKeyEvent(false, Config.DribbleKey, false, game)
+        end)
+        log("Dribbling vía tecla:", Config.DribbleKey.Name)
+    else
+        warn("[AutoDribble] No encontré remote, botón ni pude simular la tecla.")
+    end
+end
+
+local function trigger()
+    if os.clock() - lastDribble < Config.Cooldown then return end
+    lastDribble = os.clock()
+    task.delay(Config.ReactionDelay, dribble)
+end
+
+local function isTriggerTrack(track)
+    local a = track.Animation
+    local wanted = string.lower(Config.TriggerName)
+    for _, n in ipairs({ track.Name, a and a.Name or "" }) do
+        if n ~= "" and string.find(string.lower(n), wanted, 1, true) then
+            return true
+        end
     end
     return false
 end
 
-local function extend(c, part)
-    local cf, s = part.CFrame, part.Size / 2
-    for _, sx in ipairs({ -1, 1 }) do
-        for _, sy in ipairs({ -1, 1 }) do
-            for _, sz in ipairs({ -1, 1 }) do
-                local p = cf:PointToWorldSpace(Vector3.new(sx * s.X, sy * s.Y, sz * s.Z))
-                c.min = Vector3.new(math.min(c.min.X, p.X), math.min(c.min.Y, p.Y), math.min(c.min.Z, p.Z))
-                c.max = Vector3.new(math.max(c.max.X, p.X), math.max(c.max.Y, p.Y), math.max(c.max.Z, p.Z))
-            end
-        end
-    end
+local function isFacingMe(root, toMe)
+    local flat = Vector3.new(toMe.X, 0, toMe.Z)
+    if flat.Magnitude < 0.05 then return true end
+    local look = root.CFrame.LookVector
+    look = Vector3.new(look.X, 0, look.Z)
+    if look.Magnitude < 0.05 then return false end
+    return look.Unit:Dot(flat.Unit) >= Config.FacingDot
 end
 
-local function buildGoal(c)
-    local size = c.max - c.min
-    local alongX = size.X >= size.Z
-    local width = alongX and size.X or size.Z
-    local height = size.Y
-    if width < 4 or width > Config.MaxGoalWidth then width = Config.DefaultGoalWidth end
-    if height < 2 or height > 25 then height = 8 end
-    return { center = (c.max + c.min) / 2, alongX = alongX, width = width, height = height }
-end
+local conn = RunService.Heartbeat:Connect(function()
+    if not running then return end
 
-local function scanGoals()
-    scanTries += 1
-    local parts = {}
-    for _, d in ipairs(workspace:GetDescendants()) do
-        if d:IsA("BasePart") and nameMatches(d.Name) then
-            local y = d.Position.Y
-            if y < 100 and y > -50 then
-                local model = d:FindFirstAncestorOfClass("Model")
-                if not (model and Players:GetPlayerFromCharacter(model)) then
-                    table.insert(parts, d)
+    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return end
+
+    local nowActive = {}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        local sameTeam = Config.IgnoreTeammates and player.Team and player.Team == LocalPlayer.Team
+        if player ~= LocalPlayer and not sameTeam then
+            local char = player.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            local animator = hum and hum:FindFirstChildOfClass("Animator")
+
+            if root and animator then
+                local toMe = myRoot.Position - root.Position
+                if toMe.Magnitude <= Config.Range then
+                    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+                        if Config.Debug and not seenNames[track.Name] then
+                            seenNames[track.Name] = true
+                            log("Animación vista en rival cercano:", track.Name)
+                        end
+
+                        if isTriggerTrack(track) then
+                            nowActive[track] = true
+                            if not active[track] and isFacingMe(root, toMe) then
+                                log(Config.TriggerName .. " de", player.Name, "→ regateando")
+                                trigger()
+                            end
+                        end
+                    end
                 end
             end
         end
     end
 
-    local clusters = {}
-    for _, part in ipairs(parts) do
-        local pos = part.Position
-        local target
-        for _, c in ipairs(clusters) do
-            if (c.sum / c.n - pos).Magnitude < 30 then
-                target = c
-                break
-            end
-        end
-        if not target then
-            target = {
-                sum = Vector3.new(0, 0, 0), n = 0,
-                min = Vector3.new(math.huge, math.huge, math.huge),
-                max = Vector3.new(-math.huge, -math.huge, -math.huge),
-            }
-            table.insert(clusters, target)
-        end
-        target.sum += pos
-        target.n += 1
-        extend(target, part)
-    end
+    active = nowActive
+end)
 
-    goals = {}
-    if #clusters == 1 then
-        goals = { buildGoal(clusters[1]) }
-    elseif #clusters >= 2 then
-        local a, b, best = nil, nil, 0
-        for i = 1, #clusters do
-            for j = i + 1, #clusters do
-                local d = (clusters[i].sum / clusters[i].n - clusters[j].sum / clusters[j].n).Magnitude
-                if d > best then best, a, b = d, clusters[i], clusters[j] end
-            end
-        end
-        goals = { buildGoal(a), buildGoal(b) }
-    end
-    log("Porterías:", #goals, "| partes candidatas:", #parts)
+local api = {}
+function api.stop()
+    running = false
+    pcall(function() conn:Disconnect() end)
+    if getgenv then getgenv().AutoDribble = nil end
+    print("[AutoDribble] detenido")
+end
+function api.config() return Config end
+if getgenv then getgenv().AutoDribble = api end
+
+print("[AutoDribble] activo con '" .. Config.TriggerName .. "'")
+-- Blue Lock: Rivals — Auto Dive v4 (Remote + BodyVelocity)
+-- F6 o botón en pantalla = ON/OFF | getgenv().AutoDive.stop() = apagar todo
+-- getgenv().AutoDive.listButtons() = lista los botones de la pantalla (para ajustar DiveButtonName)
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer
+
+if getgenv().AutoDive and getgenv().AutoDive.stop then
+    pcall(getgenv().AutoDive.stop)
 end
 
-task.spawn(function()
-    while running and not manualGoals and #goals < 2 and scanTries < 6 do
-        scanGoals()
-        task.wait(5)
+local Cfg = {
+    Enabled = true,
+    Cooldown = 2.4,
+    MinSpeed = 18,
+    Range = 75,
+    MaxTime = 3.5,            -- solo se lanza si el balón llega en menos de X segundos
+    MaxDiveSpeed = 65.2,      -- velocidad lateral máxima (la del juego original)
+    PingComp = 1,             -- compensación de ping al calcular el tiempo útil (0 = apagada)
+    ExtraReach = 2,           -- studs extra hacia el lado del balón
+    RequireButton = true,     -- solo se lanza si el botón de Dive del juego está visible
+    DiveButtonName = "dive",  -- texto que se busca en el nombre/texto del botón
+    InfiniteStamina = true,
+    ShowButton = true,        -- botón ON/OFF en pantalla (para celular)
+}
+getgenv().AutoDive = Cfg
+
+local GOAL_WIDTH = 48
+local DECEL_VAL = 37
+local GROUND_VERTICAL, GROUND_GRAVITY = 35, 130
+local AIR_DIVE_MIN, AIR_DIVE_MAX, AIR_GRAVITY = 75, 85, 300
+local NUDGE_DURATION, REL_VEL_Z_MIN, BEHIND_TOL = 0.55, 1.5, 2
+
+local running, ready, areaOk = true, false, true
+local conns = {}
+local humanoid, rootPart, ball
+local DiveRemote, StaminaRemote, MovementAnims
+local animTracks = {}
+local diving, lastDive = false, 0
+local diveConn, diveBV, staminaConn, gui, btn
+local btnList, lastScan, lastCheck, btnOk, everFound = {}, 0, 0, false, false
+
+local function track(c) conns[#conns + 1] = c return c end
+
+-- Stamina infinita
+local function hookStamina()
+    if not Cfg.InfiniteStamina then return end
+    local stats = LP:FindFirstChild("PlayerStats") or LP:WaitForChild("PlayerStats", 10)
+    local stam = stats and (stats:FindFirstChild("Stamina") or stats:WaitForChild("Stamina", 5))
+    if not stam or not running then return end
+    stam.Value = 100
+    if staminaConn then staminaConn:Disconnect() end
+    staminaConn = stam:GetPropertyChangedSignal("Value"):Connect(function()
+        if running and Cfg.InfiniteStamina and stam.Value < 95 then stam.Value = 100 end
+    end)
+end
+
+-- Botón de Dive del juego: solo se lanza mientras esté visible (en el área)
+local function isShown(obj)
+    local cur = obj
+    while cur do
+        if cur:IsA("GuiObject") and not cur.Visible then return false end
+        if cur:IsA("ScreenGui") and not cur.Enabled then return false end
+        cur = cur.Parent
+    end
+    return true
+end
+
+local function isOurs(d) return gui ~= nil and d:IsDescendantOf(gui) end
+
+local function findDiveButtons()
+    local list = {}
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return list end
+    local key = string.lower(Cfg.DiveButtonName)
+    for _, d in ipairs(pg:GetDescendants()) do
+        if d:IsA("GuiButton") and not isOurs(d) then
+            local hit = string.find(string.lower(d.Name), key, 1, true)
+            if not hit and d:IsA("TextButton") then
+                hit = string.find(string.lower(d.Text), key, 1, true)
+            end
+            if hit then list[#list + 1] = d end
+        end
+    end
+    return list
+end
+
+local function diveButtonAvailable()
+    if not Cfg.RequireButton then return true end
+    local now = tick()
+    if now - lastCheck < 0.15 then return btnOk end
+    lastCheck = now
+    if now - lastScan > (btnOk and 3 or 0.5) then
+        lastScan = now
+        btnList = findDiveButtons()
+        if #btnList > 0 then everFound = true end
+    end
+    btnOk = false
+    for _, b in ipairs(btnList) do
+        if b.Parent and isShown(b) then btnOk = true break end
+    end
+    return btnOk
+end
+
+function Cfg.listButtons()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return end
+    for _, d in ipairs(pg:GetDescendants()) do
+        if d:IsA("GuiButton") and not isOurs(d) then
+            print("[AutoDive] botón:", d:GetFullName(), "| visible:", isShown(d),
+                "| texto:", d:IsA("TextButton") and d.Text or "-")
+        end
+    end
+end
+
+-- Balón y preparación
+local function getBall()
+    if ball and ball.Parent then return ball end
+    local f = workspace:FindFirstChild("Football")
+    if not f then return nil end
+    ball = f:IsA("BasePart") and f
+        or f:FindFirstChild("Hitbox") or f:FindFirstChild("BALL") or f:FindFirstChildWhichIsA("BasePart")
+    return ball
+end
+
+local function setup()
+    ready = false
+    local char = LP.Character or LP.CharacterAdded:Wait()
+    humanoid = char:WaitForChild("Humanoid")
+    rootPart = char:WaitForChild("HumanoidRootPart")
+
+    if not DiveRemote then
+        local ok, err = pcall(function()
+            local services = ReplicatedStorage:WaitForChild("Packages", 10):WaitForChild("Knit", 10):WaitForChild("Services", 10)
+            DiveRemote = services:WaitForChild("BallService", 10):WaitForChild("RE", 10):WaitForChild("Dive", 10)
+            StaminaRemote = services:WaitForChild("StaminaService", 10):WaitForChild("RE", 10):WaitForChild("DecreaseStamina", 10)
+            MovementAnims = ReplicatedStorage:WaitForChild("Assets", 10):WaitForChild("ReplicatedAnims", 10):WaitForChild("Movement", 10)
+        end)
+        if not ok then
+            DiveRemote = nil
+            warn("[AutoDive] no encontré los remotes del juego:", err)
+            return
+        end
+    end
+    if not running then return end
+
+    local animator = humanoid:FindFirstChildOfClass("Animator") or humanoid
+    animTracks = {}
+    for _, name in ipairs({ "DiveL", "DiveR" }) do
+        local anim = MovementAnims:FindFirstChild(name)
+        if anim then animTracks[name] = animator:LoadAnimation(anim) end
+    end
+    ready = true
+end
+
+-- Detección: devuelve una tabla si el balón va hacia el arco
+local function incoming(b)
+    local vel = b.AssemblyLinearVelocity
+    if vel.Magnitude < Cfg.MinSpeed then return end
+
+    local cf = rootPart.CFrame
+    local relVel = cf:VectorToObjectSpace(vel)
+    local relPos = cf:PointToObjectSpace(b.Position)
+
+    -- debe acercarse de frente (se tolera un balón apenas a la altura del portero)
+    local ahead = -relPos.Z
+    if relVel.Z <= REL_VEL_Z_MIN or ahead < -BEHIND_TOL then return end
+
+    local t = math.max(math.max(ahead, 0) / relVel.Z, 0.03)
+    if t > Cfg.MaxTime then return end
+
+    -- altura al llegar. Si el balón rueda, o caería al suelo antes de llegar
+    -- (rebota y sigue), se trata como tiro raso en vez de descartarlo
+    local y0 = b.Position.Y
+    local restY = math.max(b.Size.Y * 0.5, 1)
+    local px = relPos.X + relVel.X * t
+    local py = y0 + vel.Y * t - 0.5 * workspace.Gravity * t * t
+    local grounded = false
+    if y0 < 4 and math.abs(vel.Y) < 10 then
+        grounded, py = true, y0
+    elseif py <= restY + 0.5 then
+        grounded, py = true, restY
+    end
+
+    if math.abs(px) < GOAL_WIDTH / 2 and py < 29 then
+        return { vel = vel, relVel = relVel, relPos = relPos, grounded = grounded, t = t, px = px, py = py }
+    end
+end
+
+-- Lanzamiento
+-- Distancia lateral que recorre el lanzamiento en T segundos con velocidad inicial v0
+local function disp(v0, T)
+    if T <= 0.08 then return v0 * T end
+    local t2 = T - 0.08
+    if v0 / DECEL_VAL >= t2 then
+        return v0 * T - 0.5 * DECEL_VAL * t2 * t2
+    end
+    return v0 * 0.08 + v0 * v0 / (2 * DECEL_VAL)
+end
+
+-- Velocidad justa para recorrer d studs en T segundos (sin pasarse del balón)
+local function speedFor(d, T)
+    local lo, hi = 0, Cfg.MaxDiveSpeed
+    if disp(hi, T) <= d then return hi end
+    for _ = 1, 14 do
+        local mid = (lo + hi) / 2
+        if disp(mid, T) < d then lo = mid else hi = mid end
+    end
+    return hi
+end
+
+local function endDive(restore)
+    if diveConn then diveConn:Disconnect() diveConn = nil end
+    if diveBV then pcall(function() diveBV:Destroy() end) diveBV = nil end
+    if restore and rootPart and rootPart.Parent then
+        local v = rootPart.AssemblyLinearVelocity
+        rootPart.AssemblyLinearVelocity = Vector3.new(v.X * 0.25, math.min(v.Y, -14), v.Z * 0.25)
+        if humanoid then humanoid:ChangeState(Enum.HumanoidStateType.GettingUp) end
+    end
+    diving = false
+end
+
+-- El servidor ve tu movimiento con retraso: se descuenta del tiempo útil
+local function latency()
+    local ok, p = pcall(function() return LP:GetNetworkPing() end)
+    if ok and type(p) == "number" then return math.clamp(p * Cfg.PingComp, 0, 0.3) end
+    return 0
+end
+
+local function performDive(b, info)
+    local now = tick()
+    if diving or not ready or now - lastDive < Cfg.Cooldown then return end
+    diving, lastDive = true, now
+
+    local root, vel, relVel, relPos = rootPart, info.vel, info.relVel, info.relPos
+    local g = workspace.Gravity
+
+    -- datos para el servidor
+    local pTime = math.clamp(math.abs(relPos.Z / math.max(math.abs(relVel.Z), 0.5)), 0.01, 1.5)
+    local targetPos = b.Position + vel * pTime
+    if info.grounded then
+        targetPos = Vector3.new(targetPos.X, info.py, targetPos.Z)
+    else
+        targetPos = targetPos + Vector3.new(0, -0.5 * g * pTime * pTime, 0)
+    end
+
+    local currentRelY = b.Position.Y - root.Position.Y
+    local predictedRelY = targetPos.Y - root.Position.Y
+    local isAirShot = not info.grounded and ((predictedRelY > 4) or (currentRelY > 4))
+
+    -- lateral: solo lo necesario para quedar en la trayectoria del balón a tiempo
+    local T = math.clamp(info.t - latency(), 0.08, NUDGE_DURATION)
+    local dir = info.px >= 0 and 1 or -1
+    local velX = dir * speedFor(math.abs(info.px) + Cfg.ExtraReach, T)
+    local animName, dirKey = "DiveL", "l"
+    if dir > 0 then animName, dirKey = "DiveR", "r" end
+
+    -- vertical: tiros altos como antes; a ras de suelo, a la altura del balón
+    local diveV, grav
+    if isAirShot then
+        diveV = math.clamp(AIR_DIVE_MIN + math.max(currentRelY, predictedRelY) * 2.5, AIR_DIVE_MIN, AIR_DIVE_MAX)
+        grav = AIR_GRAVITY
+    else
+        grav = GROUND_GRAVITY
+        local h = math.clamp(info.py - root.Position.Y, -3, 4)
+        diveV = math.clamp((h + 0.5 * grav * T * T) / T, 0, GROUND_VERTICAL)
+    end
+
+    pcall(function() StaminaRemote:FireServer(10) end)
+    pcall(function() DiveRemote:FireServer(targetPos, pTime, dirKey) end)
+
+    local anim = animTracks[animName]
+    if anim then
+        anim.Priority = Enum.AnimationPriority.Action4
+        anim:Play(0, 1, math.clamp(1.4 * NUDGE_DURATION / math.max(T, 0.25), 1.4, 2.2))
+    end
+
+    humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+
+    endDive(false)
+    diving = true
+    local bv = Instance.new("BodyVelocity")
+    bv.MaxForce = Vector3.new(1, 1, 1) * 2500000
+    bv.Parent = root
+    diveBV = bv
+
+    root.AssemblyLinearVelocity = root.CFrame:VectorToWorldSpace(Vector3.new(velX, 0, 0)) + Vector3.new(0, diveV, 0)
+
+    local startTime = tick()
+    local vx, vv = velX, diveV
+    diveConn = RunService.Heartbeat:Connect(function(dt)
+        if not running or not root.Parent or not bv.Parent or humanoid.Health <= 0 then
+            endDive(false)
+            return
+        end
+        local elapsed = tick() - startTime
+        if elapsed > NUDGE_DURATION then
+            endDive(true)
+            return
+        end
+        bv.Velocity = root.CFrame:VectorToWorldSpace(Vector3.new(vx, 0, 0)) + Vector3.new(0, vv, 0)
+        if elapsed > 0.08 then
+            local step = dt * DECEL_VAL
+            if vx > step then vx = vx - step elseif vx < -step then vx = vx + step else vx = 0 end
+        end
+        vv = vv - dt * grav
+    end)
+end
+
+-- Control: botón ON/OFF, bucle principal y apagado
+local function refreshButton()
+    if not btn then return end
+    if not Cfg.Enabled then
+        btn.Text, btn.BackgroundColor3 = "Dive: OFF", Color3.fromRGB(75, 78, 95)
+    elseif areaOk then
+        btn.Text, btn.BackgroundColor3 = "Dive: ON", Color3.fromRGB(60, 190, 110)
+    else
+        btn.Text, btn.BackgroundColor3 = "Dive: fuera", Color3.fromRGB(200, 140, 40)
+    end
+end
+
+local function toggle()
+    Cfg.Enabled = not Cfg.Enabled
+    print("[AutoDive]", Cfg.Enabled and "ON" or "OFF")
+    refreshButton()
+end
+
+track(RunService.Heartbeat:Connect(function()
+    if not Cfg.Enabled or diving or not ready then return end
+    if not rootPart or not rootPart.Parent or humanoid.Health <= 0 then return end
+
+    local ok = diveButtonAvailable()
+    if ok ~= areaOk then areaOk = ok refreshButton() end
+    if not ok then return end
+
+    local b = getBall()
+    if not b or (b.Position - rootPart.Position).Magnitude > Cfg.Range then return end
+
+    local info = incoming(b)
+    if info then performDive(b, info) end
+end))
+
+track(UIS.InputBegan:Connect(function(input, gpe)
+    if not gpe and input.KeyCode == Enum.KeyCode.F6 then toggle() end
+end))
+
+if Cfg.ShowButton then
+    pcall(function()
+        gui = Instance.new("ScreenGui")
+        gui.Name = "ADToggle"
+        gui.ResetOnSpawn = false
+        gui.DisplayOrder = 999
+        btn = Instance.new("TextButton")
+        btn.Size = UDim2.fromOffset(92, 34)
+        btn.Position = UDim2.new(1, -102, 0, 70)
+        btn.AutoButtonColor = false
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 13
+        btn.TextColor3 = Color3.new(1, 1, 1)
+        btn.Parent = gui
+        Instance.new("UICorner", btn)
+        refreshButton()
+        btn.Activated:Connect(toggle)
+        gui.Parent = LP:WaitForChild("PlayerGui", 5)
+    end)
+end
+
+function Cfg.stop()
+    running = false
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    if staminaConn then staminaConn:Disconnect() staminaConn = nil end
+    if diving then endDive(true) end
+    if gui then pcall(function() gui:Destroy() end) end
+    print("[AutoDive] detenido")
+end
+
+task.spawn(setup)
+task.spawn(hookStamina)
+track(LP.CharacterAdded:Connect(function()
+    ready = false
+    task.wait(0.5)
+    if not running then return end
+    setup()
+    task.wait(1)
+    hookStamina()
+end))
+
+task.delay(15, function()
+    if running and Cfg.RequireButton and not everFound then
+        warn("[AutoDive] No he visto ningún botón con '" .. Cfg.DiveButtonName ..
+            "'. Si estás en el área, usa getgenv().AutoDive.listButtons() y cambia DiveButtonName.")
     end
 end)
 
-local function isOwn(g)
-    return ownGoal ~= nil and (g.center - ownGoal).Magnitude < 25
+print("[AutoDive] v4 cargado | F6 o botón = ON/OFF")
+
+-- Blue Hub (loader): menú con botones. Descarga cada módulo de tu GitHub al activarlo.
+-- Ejecutar: loadstring(game:HttpGet("URL_RAW_DE_ESTE_ARCHIVO"))()
+
+-- Tu URL raw SIN el nombre del archivo (debe terminar en "/")
+local BASE = "https://raw.githubusercontent.com/USUARIO/REPO/main/"
+-- Nombres de tus archivos en GitHub
+local FILES = { dive = "autodive.lua", dribble = "autodribble.lua" }
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local LP = Players.LocalPlayer
+
+if getgenv and getgenv().BlueHub then
+    pcall(function() getgenv().BlueHub.stop() end)
 end
 
--- elige la portería que más estás mirando (dentro del rango)
-local function pickGoal(myRoot)
-    local best, bestDot, bestDist
-    local look = myRoot.CFrame.LookVector
-    look = Vector3.new(look.X, 0, look.Z)
-    for _, g in ipairs(goals) do
-        if not isOwn(g) then
-            local to = g.center - myRoot.Position
-            local dist = to.Magnitude
-            if dist >= Config.MinGoalRange and dist <= Config.GoalRange then
-                local flat = Vector3.new(to.X, 0, to.Z)
-                local dot = 1
-                if look.Magnitude > 0.05 and flat.Magnitude > 0.05 then
-                    dot = look.Unit:Dot(flat.Unit)
-                end
-                if dot >= Config.FacingDot and (not bestDot or dot > bestDot) then
-                    best, bestDot, bestDist = g, dot, dist
-                end
-            end
-        end
+local Hub = { conns = {}, alive = true }
+local notify = function() end -- se reasigna al crear la interfaz
+
+-- Descarga y ejecuta un archivo de tu GitHub
+local function runFile(file)
+    if string.find(BASE, "USUARIO", 1, true) then
+        return false, "edita BASE en el hub (tu URL raw)"
     end
-    return best, bestDist
-end
-
-local function randomPoint(g)
-    local t = Config.HorizMargin + math.random() * (1 - 2 * Config.HorizMargin)
-    local off = (t - 0.5) * g.width
-    local x, z = g.center.X, g.center.Z
-    if g.alongX then x += off else z += off end
-    local base = g.center.Y - g.height / 2
-    local hf = Config.HeightMin + math.random() * (Config.HeightMax - Config.HeightMin)
-    return Vector3.new(x, base + g.height * hf, z)
-end
-
-local function marker(pos)
-    local p = Instance.new("Part")
-    p.Shape = Enum.PartType.Ball
-    p.Size = Vector3.new(1.5, 1.5, 1.5)
-    p.Material = Enum.Material.Neon
-    p.Color = Color3.fromRGB(255, 60, 60)
-    p.Anchored = true
-    p.CanCollide = false
-    p.CanQuery = false
-    p.Position = pos
-    p.Parent = workspace
-    Debris:AddItem(p, 2.5)
-end
-
--- ========== PELOTA ==========
-
-local ballCache
-local function getBall()
-    if ballCache and ballCache.Parent then return ballCache end
-    local f = workspace:FindFirstChild("Football")
-        or workspace:FindFirstChild("Ball")
-        or workspace:FindFirstChild("Football", true)
-    local part
-    if f then
-        if f:IsA("BasePart") then
-            part = f
-        else
-            part = f:FindFirstChild("Hitbox")
-                or f:FindFirstChild("BALL")
-                or (f:IsA("Model") and f.PrimaryPart)
-                or f:FindFirstChildWhichIsA("BasePart", true)
-        end
-    end
-    ballCache = part
-    return part
-end
-
--- ========== APUNTAR (personaje + cámara bloqueados mientras sale el tiro) ==========
-
-local AIM_BIND = "AutoShotAim"
-
-local function lockAim(hum, myRoot, target, duration)
-    pcall(function() RunService:UnbindFromRenderStep(AIM_BIND) end)
-    local cam = workspace.CurrentCamera
-    local endAt = os.clock() + duration
-    local prevAuto = hum.AutoRotate
-    hum.AutoRotate = false
-
-    RunService:BindToRenderStep(AIM_BIND, Enum.RenderPriority.Camera.Value + 1, function()
-        if os.clock() > endAt or not myRoot.Parent then
-            pcall(function() RunService:UnbindFromRenderStep(AIM_BIND) end)
-            pcall(function() hum.AutoRotate = prevAuto end)
-            return
-        end
-        local p = myRoot.Position
-        myRoot.CFrame = CFrame.lookAt(p, Vector3.new(target.X, p.Y, target.Z))
-        if Config.AlsoTurnCamera and cam then
-            cam.CFrame = CFrame.lookAt(cam.CFrame.Position, target)
-        end
+    local okGet, src = pcall(function()
+        return game:HttpGet(BASE .. file .. "?t=" .. os.time())
     end)
+    if not okGet or type(src) ~= "string" or #src < 20 or string.find(src, "^404") then
+        return false, "no pude descargar " .. file
+    end
+    local fn, err = loadstring(src)
+    if not fn then
+        warn("[BlueHub] sintaxis en " .. file .. ":", err)
+        return false, "error de sintaxis en " .. file
+    end
+    local okRun, runErr = pcall(fn)
+    if not okRun then
+        warn("[BlueHub] error al ejecutar " .. file .. ":", runErr)
+        return false, "error al ejecutar " .. file
+    end
+    return true
 end
 
--- ========== DESVIAR LA PELOTA (modo Redirect) ==========
+--==========================================================================
+-- MÓDULOS (cada uno: enable() -> true | false, mensaje ; disable() ; stop())
+--==========================================================================
+local Modules = {}
 
-local function redirectBall(target, extraDelay)
-    task.wait(extraDelay + Config.RedirectDelay)
-    local ball = getBall()
-    if not ball then return end
+Modules.dribble = {
+    enable = function()
+        local ok, err = runFile(FILES.dribble)
+        if not ok then return false, "Auto Dribleo: " .. err end
+        return true
+    end,
+    disable = function()
+        pcall(function() getgenv().AutoDribble.stop() end)
+    end,
+}
+Modules.dribble.stop = Modules.dribble.disable
 
-    if isnetworkowner then
-        local ok, owned = pcall(isnetworkowner, ball)
-        if ok and not owned then
-            log("La pelota la controla el servidor: no se puede desviar desde aquí")
-            return
+local diveLoaded = false
+Modules.dive = {
+    enable = function()
+        if not diveLoaded then
+            local okRemotes = pcall(function()
+                local s = ReplicatedStorage:WaitForChild("Packages", 5):WaitForChild("Knit", 5):WaitForChild("Services", 5)
+                s:WaitForChild("BallService", 5):WaitForChild("RE", 5):WaitForChild("Dive", 5)
+            end)
+            if not okRemotes then return false, "Auto Save: no encontré los remotes del juego" end
+
+            local ok, err = runFile(FILES.dive)
+            if not ok then return false, "Auto Save: " .. err end
+            diveLoaded = true
+
+            -- el hub ya tiene su botón: se quitan los extras del script
+            local C = getgenv().AutoDive
+            if C then C.InfiniteStamina = false end
+            local pg = LP:FindFirstChild("PlayerGui")
+            local extra = pg and pg:FindFirstChild("ADToggle")
+            if extra then pcall(function() extra:Destroy() end) end
         end
-    end
+        local C = getgenv().AutoDive
+        if not C then return false, "Auto Save: no se cargó" end
+        C.Enabled = true
+        return true
+    end,
+    disable = function()
+        local C = getgenv().AutoDive
+        if C then C.Enabled = false end
+    end,
+    stop = function()
+        pcall(function() getgenv().AutoDive.stop() end)
+    end,
+}
 
-    local speed = ball.AssemblyLinearVelocity.Magnitude
-    if speed < 5 then speed = 90 end
-    local dir = target - ball.Position
-    local t = math.max(dir.Magnitude / speed, 0.05)
-    local vel = dir / t
-    if Config.CompensateGravity then
-        vel += Vector3.new(0, workspace.Gravity * t / 2, 0)
-    end
-    ball.AssemblyLinearVelocity = vel
-    log("Pelota desviada, velocidad:", math.floor(vel.Magnitude))
-end
-
--- ========== INTERCEPTAR TU TIRO ==========
-
--- devuelve "block" (cancela el tiro original y lo reenvía apuntado),
--- "pass" (deja pasar con argumentos modificados) o nil (no tocar nada)
-local function handleShot(remote, args)
-    log("Tiro detectado, argumentos:", args.n, args[1])
-
-    local char = LocalPlayer.Character
-    local myRoot = char and char:FindFirstChild("HumanoidRootPart")
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if not myRoot or not hum or hum.Health <= 0 then
-        log("→ sin personaje")
-        return nil
-    end
-
-    if Config.RequireBall then
-        local ball = getBall()
-        if not ball then
-            log("→ no encuentro la pelota (workspace.Football)")
-            return nil
+local stam = { conn = nil, on = false }
+Modules.stamina = {
+    enable = function()
+        stam.on = true
+        local stats = LP:FindFirstChild("PlayerStats") or LP:WaitForChild("PlayerStats", 10)
+        local s = stats and (stats:FindFirstChild("Stamina") or stats:WaitForChild("Stamina", 5))
+        if not s then
+            stam.on = false
+            return false, "Stamina: no encontré PlayerStats"
         end
-        local d = (ball.Position - myRoot.Position).Magnitude
-        if d > Config.BallRange then
-            log(("→ pelota lejos: %.1f studs (máx %d)"):format(d, Config.BallRange))
-            return nil
-        end
-    end
-
-    local goal, dist = pickGoal(myRoot)
-    if not goal then
-        log("→ ninguna portería en rango (porterías encontradas: " .. #goals .. ")")
-        return nil
-    end
-
-    local target = randomPoint(goal)
-    if Config.ShowMarker then marker(target) end
-    if Config.PowerOverride then args[1] = Config.PowerOverride end
-    log(("→ desviando a punto aleatorio (%.0f studs) modo %s"):format(dist, Config.Mode))
-
-    local doAim = Config.Mode == "Aim" or Config.Mode == "Both"
-    local doRedirect = Config.Mode == "Redirect" or Config.Mode == "Both"
-
-    if doRedirect then
-        task.spawn(redirectBall, target, doAim and Config.AimDelay or 0)
-    end
-
-    if doAim then
-        lockAim(hum, myRoot, target, Config.AimDelay + 0.3)
-        task.spawn(function()
-            task.wait(Config.AimDelay)
-            bypass = true
-            pcall(function() remote:FireServer(table.unpack(args, 1, args.n)) end)
-            bypass = false
+        if stam.conn then stam.conn:Disconnect() end
+        s.Value = 100
+        stam.conn = s:GetPropertyChangedSignal("Value"):Connect(function()
+            if stam.on and s.Value < 95 then s.Value = 100 end
         end)
-        return "block"
-    end
+        return true
+    end,
+    disable = function()
+        stam.on = false
+        if stam.conn then stam.conn:Disconnect() stam.conn = nil end
+    end,
+}
+Modules.stamina.stop = Modules.stamina.disable
 
-    return Config.PowerOverride and "pass" or nil
-end
+local options = {
+    { key = "dribble", name = "Auto Dribleo",     desc = "Regatea cuando te hacen Sliding", mod = Modules.dribble },
+    { key = "dive",    name = "Auto Save",        desc = "Portero: se lanza a los tiros",   mod = Modules.dive },
+    { key = "stamina", name = "Stamina infinita", desc = "Mantiene la stamina en 100",      mod = Modules.stamina },
+}
 
-if not hookmetamethod or not getnamecallmethod then
-    warn("[AutoShot] Tu executor no soporta hookmetamethod: no puedo detectar tu tiro.")
-else
-    local old
-    old = hookmetamethod(game, "__namecall", (newcclosure or function(f) return f end)(function(self, ...)
-        local method = getnamecallmethod()
-        if method == "FireServer" and running and not bypass and isShoot(self) then
-            shotsSeen += 1
-            if Config.Enabled then
-                local args = table.pack(...)
-                local ok, action = pcall(handleShot, self, args)
-                if setnamecallmethod then setnamecallmethod(method) end
-                if ok then
-                    if action == "block" then return end
-                    if action == "pass" then return old(self, table.unpack(args, 1, args.n)) end
-                else
-                    warn("[AutoShot] error:", action)
-                end
-            end
+--==========================================================================
+-- INTERFAZ
+--==========================================================================
+local gui = nil
+
+-- Prueba varios lugares hasta que la interfaz quede realmente dentro del juego
+local function mountGui(g)
+    local candidates = {
+        function() return LP:WaitForChild("PlayerGui", 5) end,
+        function() return gethui and gethui() end,
+        function() return game:GetService("CoreGui") end,
+    }
+    for _, getParent in ipairs(candidates) do
+        local ok, parent = pcall(getParent)
+        if ok and parent then
+            local ok2 = pcall(function() g.Parent = parent end)
+            if ok2 and g.Parent == parent then return parent end
         end
-        return old(self, ...)
-    end))
-    hookInstalled = true
-end
-
--- ========== BOTÓN ==========
-
-local ON_COLOR = Color3.fromRGB(46, 204, 113)
-local OFF_COLOR = Color3.fromRGB(231, 76, 60)
-local render
-
-local function setEnabled(v)
-    Config.Enabled = v
-    if render then render() end
-end
-
-local function guiParent()
-    if gethui then
-        local ok, h = pcall(gethui)
-        if ok and h then return h end
     end
-    local ok = pcall(function() return game:GetService("CoreGui"):GetChildren() end)
-    if ok then return game:GetService("CoreGui") end
-    return LocalPlayer:WaitForChild("PlayerGui")
+    return nil
 end
 
-if Config.ShowButton then
+function Hub.stop()
+    Hub.alive = false
+    for _, opt in ipairs(options) do
+        pcall(opt.mod.stop or opt.mod.disable)
+    end
+    for _, c in ipairs(Hub.conns) do pcall(function() c:Disconnect() end) end
+    if gui then pcall(function() gui:Destroy() end) end
+    if getgenv then getgenv().BlueHub = nil end
+    print("[BlueHub] cerrado")
+end
+
+local function buildUi()
+    local BG        = Color3.fromRGB(22, 24, 32)
+    local ROW       = Color3.fromRGB(34, 37, 50)
+    local ACCENT    = Color3.fromRGB(70, 130, 255)
+    local ON_COLOR  = Color3.fromRGB(60, 190, 110)
+    local OFF_COLOR = Color3.fromRGB(75, 78, 95)
+    local TEXT      = Color3.fromRGB(240, 240, 245)
+    local SUBTEXT   = Color3.fromRGB(150, 155, 175)
+
+    local function corner(inst, r)
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, r)
+        c.Parent = inst
+    end
+
     gui = Instance.new("ScreenGui")
-    gui.Name = "AutoShotGui"
+    gui.Name = "BlueHub"
     gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 999
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
-    local card = Instance.new("Frame")
-    card.Size = UDim2.fromOffset(170, 48)
-    card.Position = UDim2.new(0, 12, 0.5, -24)
-    card.BackgroundColor3 = Color3.fromRGB(24, 24, 32)
-    card.BorderSizePixel = 0
-    card.Active = true
-    card.Parent = gui
-    Instance.new("UICorner", card).CornerRadius = UDim.new(0, 24)
+    local WIDTH, TITLE_H, ROW_H, GAP, STATUS_H = 250, 38, 42, 4, 20
+    local expandedH = TITLE_H + 8 + #options * (ROW_H + GAP) + STATUS_H + 8
 
+    local main = Instance.new("Frame")
+    main.Name = "Main"
+    main.Size = UDim2.fromOffset(WIDTH, expandedH)
+    main.Position = UDim2.new(0.5, -WIDTH / 2, 0, 70)
+    main.BackgroundColor3 = BG
+    main.BorderSizePixel = 0
+    main.Active = true
+    main.ClipsDescendants = true
+    main.Parent = gui
+    corner(main, 10)
     local stroke = Instance.new("UIStroke")
-    stroke.Thickness = 2
-    stroke.Color = ON_COLOR
-    stroke.Parent = card
+    stroke.Color = ACCENT
+    stroke.Thickness = 1
+    stroke.Parent = main
 
-    local title = Instance.new("TextLabel")
-    title.BackgroundTransparency = 1
-    title.Position = UDim2.fromOffset(16, 6)
-    title.Size = UDim2.fromOffset(96, 20)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 15
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.TextColor3 = Color3.new(1, 1, 1)
-    title.Text = "⚽ AutoShot"
-    title.Parent = card
+    local title = Instance.new("Frame")
+    title.Size = UDim2.new(1, 0, 0, TITLE_H)
+    title.BackgroundColor3 = ROW
+    title.BorderSizePixel = 0
+    title.Active = true
+    title.Parent = main
+    corner(title, 10)
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Position = UDim2.fromOffset(12, 0)
+    titleLabel.Size = UDim2.new(1, -80, 1, 0)
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 15
+    titleLabel.TextColor3 = TEXT
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Text = "Blue Hub"
+    titleLabel.Parent = title
+
+    local function titleButton(text, offsetX)
+        local b = Instance.new("TextButton")
+        b.AnchorPoint = Vector2.new(1, 0.5)
+        b.Position = UDim2.new(1, offsetX, 0.5, 0)
+        b.Size = UDim2.fromOffset(28, 26)
+        b.BackgroundColor3 = OFF_COLOR
+        b.AutoButtonColor = false
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 16
+        b.TextColor3 = TEXT
+        b.Text = text
+        b.Parent = title
+        corner(b, 6)
+        return b
+    end
+
+    local closeBtn = titleButton("X", -6)
+    local minBtn = titleButton("-", -40)
+
+    local body = Instance.new("Frame")
+    body.Position = UDim2.fromOffset(0, TITLE_H)
+    body.Size = UDim2.new(1, 0, 1, -TITLE_H)
+    body.BackgroundTransparency = 1
+    body.Parent = main
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop = UDim.new(0, 8)
+    pad.PaddingLeft = UDim.new(0, 8)
+    pad.PaddingRight = UDim.new(0, 8)
+    pad.PaddingBottom = UDim.new(0, 8)
+    pad.Parent = body
+
+    local list = Instance.new("UIListLayout")
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.Padding = UDim.new(0, GAP)
+    list.Parent = body
 
     local status = Instance.new("TextLabel")
+    status.LayoutOrder = 100
     status.BackgroundTransparency = 1
-    status.Position = UDim2.fromOffset(16, 25)
-    status.Size = UDim2.fromOffset(96, 16)
-    status.Font = Enum.Font.GothamMedium
+    status.Size = UDim2.new(1, 0, 0, STATUS_H)
+    status.Font = Enum.Font.Gotham
     status.TextSize = 11
+    status.TextColor3 = SUBTEXT
     status.TextXAlignment = Enum.TextXAlignment.Left
-    status.Parent = card
+    status.TextTruncate = Enum.TextTruncate.AtEnd
+    status.Text = "Listo"
+    status.Parent = body
 
-    local track = Instance.new("Frame")
-    track.Size = UDim2.fromOffset(44, 24)
-    track.Position = UDim2.new(1, -58, 0.5, -12)
-    track.BorderSizePixel = 0
-    track.Parent = card
-    Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+    notify = function(text) status.Text = text end
 
-    local knob = Instance.new("Frame")
-    knob.Size = UDim2.fromOffset(18, 18)
-    knob.BackgroundColor3 = Color3.new(1, 1, 1)
-    knob.BorderSizePixel = 0
-    knob.Parent = track
-    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+    for i, opt in ipairs(options) do
+        local row = Instance.new("Frame")
+        row.LayoutOrder = i
+        row.Size = UDim2.new(1, 0, 0, ROW_H)
+        row.BackgroundColor3 = ROW
+        row.BorderSizePixel = 0
+        row.Parent = body
+        corner(row, 8)
 
-    render = function()
-        local on = Config.Enabled
-        local col = on and ON_COLOR or OFF_COLOR
-        local info = TweenInfo.new(0.18, Enum.EasingStyle.Quad)
-        TweenService:Create(track, info, { BackgroundColor3 = col }):Play()
-        TweenService:Create(stroke, info, { Color = col }):Play()
-        TweenService:Create(knob, info, { Position = on and UDim2.fromOffset(23, 3) or UDim2.fromOffset(3, 3) }):Play()
-        status.Text = on and "ACTIVO" or "APAGADO"
-        status.TextColor3 = col
+        local name = Instance.new("TextLabel")
+        name.BackgroundTransparency = 1
+        name.Position = UDim2.fromOffset(10, 5)
+        name.Size = UDim2.new(1, -80, 0, 18)
+        name.Font = Enum.Font.GothamBold
+        name.TextSize = 13
+        name.TextColor3 = TEXT
+        name.TextXAlignment = Enum.TextXAlignment.Left
+        name.Text = opt.name
+        name.Parent = row
+
+        local desc = Instance.new("TextLabel")
+        desc.BackgroundTransparency = 1
+        desc.Position = UDim2.fromOffset(10, 23)
+        desc.Size = UDim2.new(1, -80, 0, 14)
+        desc.Font = Enum.Font.Gotham
+        desc.TextSize = 10
+        desc.TextColor3 = SUBTEXT
+        desc.TextXAlignment = Enum.TextXAlignment.Left
+        desc.TextTruncate = Enum.TextTruncate.AtEnd
+        desc.Text = opt.desc
+        desc.Parent = row
+
+        local switch = Instance.new("TextButton")
+        switch.AnchorPoint = Vector2.new(1, 0.5)
+        switch.Position = UDim2.new(1, -10, 0.5, 0)
+        switch.Size = UDim2.fromOffset(52, 26)
+        switch.BackgroundColor3 = OFF_COLOR
+        switch.AutoButtonColor = false
+        switch.Font = Enum.Font.GothamBold
+        switch.TextSize = 12
+        switch.TextColor3 = TEXT
+        switch.Text = "OFF"
+        switch.Parent = row
+        corner(switch, 13)
+
+        local state = false
+        local function set(v, silent)
+            state = v
+            switch.Text = v and "ON" or "OFF"
+            switch.BackgroundColor3 = v and ON_COLOR or OFF_COLOR
+            if silent then return end
+
+            if v then
+                notify("Cargando " .. opt.name .. "...")
+                task.spawn(function()
+                    local called, ok, msg = pcall(opt.mod.enable)
+                    if not called then
+                        warn("[BlueHub]", opt.name, ok)
+                        ok, msg = false, opt.name .. ": error inesperado"
+                    end
+                    if not state then          -- lo apagaron mientras cargaba
+                        pcall(opt.mod.disable)
+                        return
+                    end
+                    if ok then
+                        notify(opt.name .. " activado")
+                    else
+                        pcall(opt.mod.disable)
+                        set(false, true)
+                        notify(msg or (opt.name .. ": error"))
+                        warn("[BlueHub]", msg)
+                    end
+                end)
+            else
+                pcall(opt.mod.disable)
+                notify(opt.name .. " desactivado")
+            end
+        end
+
+        switch.Activated:Connect(function() set(not state) end)
     end
-    knob.Position = UDim2.fromOffset(23, 3)
-    render()
 
-    -- tocar = ON/OFF, arrastrar = mover
-    local dragging, moved, dragStart, startPos = false, false, nil, nil
-    card.InputBegan:Connect(function(input)
+    -- Arrastrar (mouse y táctil)
+    local dragging, dragStart, startPos = false, nil, nil
+    title.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging, moved = true, false
-            dragStart, startPos = input.Position, card.Position
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
             input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                    if not moved then setEnabled(not Config.Enabled) end
-                end
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
             end)
         end
     end)
-    table.insert(conns, UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch) then
+    table.insert(Hub.conns, UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
             local d = input.Position - dragStart
-            if d.Magnitude > 8 then moved = true end
-            if moved then
-                card.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
-                    startPos.Y.Scale, startPos.Y.Offset + d.Y)
-            end
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
         end
     end))
 
-    gui.Parent = guiParent()
+    -- Minimizar / cerrar / ocultar con RightShift
+    local minimized = false
+    minBtn.Activated:Connect(function()
+        minimized = not minimized
+        main.Size = UDim2.fromOffset(WIDTH, minimized and TITLE_H or expandedH)
+        minBtn.Text = minimized and "+" or "-"
+    end)
+
+    table.insert(Hub.conns, UIS.InputBegan:Connect(function(input, gpe)
+        if gpe then return end
+        if input.KeyCode == Enum.KeyCode.RightShift then gui.Enabled = not gui.Enabled end
+    end))
+
+    closeBtn.Activated:Connect(Hub.stop)
 end
 
-table.insert(conns, UserInputService.InputBegan:Connect(function(input, processed)
-    if not processed and input.KeyCode == Config.ToggleKey then
-        setEnabled(not Config.Enabled)
+local okUi, errUi = pcall(buildUi)
+if not okUi then warn("[BlueHub] ERROR al crear la interfaz:", errUi) end
+
+if gui then
+    local parent = mountGui(gui)
+    if parent then
+        local okName, full = pcall(function() return parent:GetFullName() end)
+        print("[BlueHub] interfaz visible en:", okName and full or tostring(parent))
+    else
+        warn("[BlueHub] No pude poner la interfaz en ningún lugar (PlayerGui, gethui, CoreGui).")
     end
-end))
-
--- ========== API ==========
-
-local api = {}
-
-function api.stop()
-    running = false
-    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
-    table.clear(conns)
-    pcall(function() RunService:UnbindFromRenderStep(AIM_BIND) end)
-    if gui then pcall(function() gui:Destroy() end) end
-    if getgenv then getgenv().AutoShot = nil end
-    print("[AutoShot] detenido")
+    -- Si el juego la elimina, la vuelve a poner
+    task.spawn(function()
+        while Hub.alive do
+            task.wait(2)
+            if gui and gui.Parent == nil then mountGui(gui) end
+        end
+    end)
 end
 
-function api.toggle() setEnabled(not Config.Enabled) end
-function api.config() return Config end
-
-function api.diagGoals()
-    manualGoals = false
-    scanGoals()
-    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    for i, g in ipairs(goals) do
-        local d = myRoot and (g.center - myRoot.Position).Magnitude or 0
-        print(("  Portería %d @ %s | ancho %.1f alto %.1f | %.1f studs"):format(
-            i, tostring(g.center), g.width, g.height, d))
-    end
-end
-
--- punto rojo en la portería, sin disparar
-function api.preview()
-    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return end
-    local g = pickGoal(myRoot)
-    if g then marker(randomPoint(g)) else print("[AutoShot] ninguna portería en rango") end
-end
-
--- párate en TU portería y ejecuta esto para que nunca desvíe hacia ella
-function api.markOwnGoal()
-    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return end
-    local best, bestD
-    for _, g in ipairs(goals) do
-        local d = (g.center - myRoot.Position).Magnitude
-        if not bestD or d < bestD then best, bestD = g, d end
-    end
-    if best then
-        ownGoal = best.center
-        print("[AutoShot] portería propia marcada")
-    end
-end
-function api.clearOwnGoal() ownGoal = nil end
-
-function api.status()
-    local ball = getBall()
-    print("Hook instalado:", hookInstalled, "| Tiros detectados:", shotsSeen)
-    print("Shoot:", ShootRemote and ShootRemote:GetFullName() or "NIL")
-    print("Pelota:", ball and ball:GetFullName() or "NIL")
-    print("Porterías:", #goals, "| Modo:", Config.Mode, "| Activo:", Config.Enabled)
-end
-
-if getgenv then getgenv().AutoShot = api end
-
-print("[AutoShot v7] activo — hook:", hookInstalled, "| K o botón = ON/OFF | .status() .diagGoals() .preview()")
+if getgenv then getgenv().BlueHub = Hub end
+print("[BlueHub] cargado")
