@@ -976,6 +976,7 @@ if gui then
         print("[BlueHub] interfaz visible en:", okName and full or tostring(parent))
     else
         warn("[BlueHub] No pude poner la interfaz en ningún lugar (PlayerGui, gethui, CoreGui).")
+
     end
     -- Si el juego la elimina, la vuelve a poner
     task.spawn(function()
@@ -988,3 +989,4 @@ end
 
 if getgenv then getgenv().BlueHub = Hub end
 print("[BlueHub] cargado")
+local BASE = "https://raw.githubusercontent.com/krz861521-del/Kino/refs/heads/main/"
