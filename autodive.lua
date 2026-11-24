@@ -1,398 +1,485 @@
--- Blue Lock: Rivals — Auto Dive v4 (Remote + BodyVelocity)
--- F6 o botón en pantalla = ON/OFF | getgenv().AutoDive.stop() = apagar todo
--- getgenv().AutoDive.listButtons() = lista los botones de la pantalla (para ajustar DiveButtonName)
+-- Config.lua
+local Config = {}
+
+-- Valores por defecto
+Config.Defaults = {
+    WalkSpeed = 16,
+    JumpPower = 50,
+    FlySpeed = 50,
+    BallESP = true,
+    PlayerESP = false,
+    FullBright = false,
+    AntiAFK = true,
+}
+
+-- Ruta del archivo de guardado (usando la API de Rayfield)
+Config.SaveFile = "BlueLockRivals_Config.json"
+
+-- Función para cargar configuración guardada (si existe)
+function Config.load()
+    local success, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(
+            readfile(Config.SaveFile)
+        )
+    end)
+    if success and type(data) == "table" then
+        for k, v in pairs(data) do
+            if Config.Defaults[k] ~= nil then
+                Config.Defaults[k] = v
+            end
+        end
+    end
+    return Config.Defaults
+end
+
+-- Función para guardar la configuración actual
+function Config.save(current)
+    local success, err = pcall(function()
+        writefile(Config.SaveFile, game:GetService("HttpService"):JSONEncode(current))
+    end)
+    if not success then
+        warn("[BlueLockRivals] No se pudo guardar la configuración: " .. tostring(err))
+    end
+end
+
+return Config
+-- Modules/Utilities.lua
+local Utilities = {}
+
+local Lighting = game:GetService("Lighting")
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+-- FullBright
+function Utilities.setFullBright(enabled)
+    if enabled then
+        Lighting.Ambient = Color3.fromRGB(255, 255, 255)
+        Lighting.OutdoorAmbient = Color3.fromRGB(255, 255, 255)
+    else
+        Lighting.Ambient = Color3.fromRGB(0, 0, 0)
+        Lighting.OutdoorAmbient = Color3.fromRGB(128, 128, 128)
+    end
+end
+
+-- Anti‑AFK (evita el kick por inactividad)
+local antiAFKConnection
+function Utilities.setAntiAFK(enabled)
+    if enabled and not antiAFKConnection then
+        antiAFKConnection = game:GetService("RunService").Heartbeat:Connect(function()
+            local vu = game:GetService("VirtualUser")
+            vu:CaptureController()
+            vu:ClickButton2(Vector2.new())
+        end)
+    elseif not enabled and antiAFKConnection then
+        antiAFKConnection:Disconnect()
+        antiAFKConnection = nil
+    end
+end
+
+-- Teleport a una posición fija (spawn)
+function Utilities.teleportToSpawn()
+    local char = player.Character
+    if char and char:FindFirstChild("HumanoidRootPart") then
+        char.HumanoidRootPart.CFrame = CFrame.new(0, 5, 0) -- Ajusta según el mapa
+    end
+end
+
+return Utilities
+
+-- Modules/PlayerEnhancer.lua
+local PlayerEnhancer = {}
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local UIS = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local LP = Players.LocalPlayer
+local player = Players.LocalPlayer
 
-if getgenv().AutoDive and getgenv().AutoDive.stop then
-    pcall(getgenv().AutoDive.stop)
-end
-
-local Cfg = {
-    Enabled = true,
-    Cooldown = 2.4,
-    MinSpeed = 18,
-    Range = 75,
-    MaxTime = 3.5,            -- solo se lanza si el balón llega en menos de X segundos
-    MaxDiveSpeed = 65.2,      -- velocidad lateral máxima (la del juego original)
-    PingComp = 1,             -- compensación de ping al calcular el tiempo útil (0 = apagada)
-    ExtraReach = 2,           -- studs extra hacia el lado del balón
-    RequireButton = true,     -- solo se lanza si el botón de Dive del juego está visible
-    DiveButtonName = "dive",  -- texto que se busca en el nombre/texto del botón
-    InfiniteStamina = true,
-    ShowButton = true,        -- botón ON/OFF en pantalla (para celular)
-}
-getgenv().AutoDive = Cfg
-
-local GOAL_WIDTH = 48
-local DECEL_VAL = 37
-local GROUND_VERTICAL, GROUND_GRAVITY = 35, 130
-local AIR_DIVE_MIN, AIR_DIVE_MAX, AIR_GRAVITY = 75, 85, 300
-local NUDGE_DURATION, REL_VEL_Z_MIN, BEHIND_TOL = 0.55, 1.5, 2
-
-local running, ready, areaOk = true, false, true
-local conns = {}
-local humanoid, rootPart, ball
-local DiveRemote, StaminaRemote, MovementAnims
-local animTracks = {}
-local diving, lastDive = false, 0
-local diveConn, diveBV, staminaConn, gui, btn
-local btnList, lastScan, lastCheck, btnOk, everFound = {}, 0, 0, false, false
-
-local function track(c) conns[#conns + 1] = c return c end
-
--- Stamina infinita
-local function hookStamina()
-    if not Cfg.InfiniteStamina then return end
-    local stats = LP:FindFirstChild("PlayerStats") or LP:WaitForChild("PlayerStats", 10)
-    local stam = stats and (stats:FindFirstChild("Stamina") or stats:WaitForChild("Stamina", 5))
-    if not stam or not running then return end
-    stam.Value = 100
-    if staminaConn then staminaConn:Disconnect() end
-    staminaConn = stam:GetPropertyChangedSignal("Value"):Connect(function()
-        if running and Cfg.InfiniteStamina and stam.Value < 95 then stam.Value = 100 end
-    end)
-end
-
--- Botón de Dive del juego: solo se lanza mientras esté visible (en el área)
-local function isShown(obj)
-    local cur = obj
-    while cur do
-        if cur:IsA("GuiObject") and not cur.Visible then return false end
-        if cur:IsA("ScreenGui") and not cur.Enabled then return false end
-        cur = cur.Parent
+-- Infinite Stamina (modifica el valor local, puede no replicarse)
+function PlayerEnhancer.setInfiniteStamina(enabled)
+    local char = player.Character
+    if not char then return end
+    local stamina = char:FindFirstChild("Stamina") -- nombre típico en el juego
+    if stamina and stamina:IsA("NumberValue") then
+        if enabled then
+            stamina.Value = math.huge
+        else
+            stamina.Value = 100 -- valor por defecto aproximado
+        end
     end
-    return true
 end
 
-local function isOurs(d) return gui ~= nil and d:IsDescendantOf(gui) end
+-- WalkSpeed
+function PlayerEnhancer.setWalkSpeed(speed)
+    local char = player.Character
+    if char and char:FindFirstChild("Humanoid") then
+        char.Humanoid.WalkSpeed = speed
+    end
+end
 
-local function findDiveButtons()
-    local list = {}
-    local pg = LP:FindFirstChild("PlayerGui")
-    if not pg then return list end
-    local key = string.lower(Cfg.DiveButtonName)
-    for _, d in ipairs(pg:GetDescendants()) do
-        if d:IsA("GuiButton") and not isOurs(d) then
-            local hit = string.find(string.lower(d.Name), key, 1, true)
-            if not hit and d:IsA("TextButton") then
-                hit = string.find(string.lower(d.Text), key, 1, true)
+-- JumpPower
+function PlayerEnhancer.setJumpPower(power)
+    local char = player.Character
+    if char and char:FindFirstChild("Humanoid") then
+        char.Humanoid.JumpPower = power
+        char.Humanoid.UseJumpPower = true
+    end
+end
+
+-- Fly (modo vuelo básico usando BodyVelocity)
+local flyConnection
+function PlayerEnhancer.setFly(enabled, speed)
+    local char = player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    if enabled then
+        if flyConnection then return end
+        local bv = Instance.new("BodyVelocity")
+        bv.Name = "FlyBV"
+        bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+        bv.Velocity = Vector3.zero
+        bv.Parent = hrp
+
+        flyConnection = RunService.RenderStepped:Connect(function()
+            local cam = workspace.CurrentCamera
+            local move = Vector3.zero
+            if game:GetService("UserInputService"):IsKeyDown(Enum.KeyCode.W) then
+                move += cam.CFrame.LookVector
             end
-            if hit then list[#list + 1] = d end
-        end
-    end
-    return list
-end
-
-local function diveButtonAvailable()
-    if not Cfg.RequireButton then return true end
-    local now = tick()
-    if now - lastCheck < 0.15 then return btnOk end
-    lastCheck = now
-    if now - lastScan > (btnOk and 3 or 0.5) then
-        lastScan = now
-        btnList = findDiveButtons()
-        if #btnList > 0 then everFound = true end
-    end
-    btnOk = false
-    for _, b in ipairs(btnList) do
-        if b.Parent and isShown(b) then btnOk = true break end
-    end
-    return btnOk
-end
-
-function Cfg.listButtons()
-    local pg = LP:FindFirstChild("PlayerGui")
-    if not pg then return end
-    for _, d in ipairs(pg:GetDescendants()) do
-        if d:IsA("GuiButton") and not isOurs(d) then
-            print("[AutoDive] botón:", d:GetFullName(), "| visible:", isShown(d),
-                "| texto:", d:IsA("TextButton") and d.Text or "-")
-        end
-    end
-end
-
--- Balón y preparación
-local function getBall()
-    if ball and ball.Parent then return ball end
-    local f = workspace:FindFirstChild("Football")
-    if not f then return nil end
-    ball = f:IsA("BasePart") and f
-        or f:FindFirstChild("Hitbox") or f:FindFirstChild("BALL") or f:FindFirstChildWhichIsA("BasePart")
-    return ball
-end
-
-local function setup()
-    ready = false
-    local char = LP.Character or LP.CharacterAdded:Wait()
-    humanoid = char:WaitForChild("Humanoid")
-    rootPart = char:WaitForChild("HumanoidRootPart")
-
-    if not DiveRemote then
-        local ok, err = pcall(function()
-            local services = ReplicatedStorage:WaitForChild("Packages", 10):WaitForChild("Knit", 10):WaitForChild("Services", 10)
-            DiveRemote = services:WaitForChild("BallService", 10):WaitForChild("RE", 10):WaitForChild("Dive", 10)
-            StaminaRemote = services:WaitForChild("StaminaService", 10):WaitForChild("RE", 10):WaitForChild("DecreaseStamina", 10)
-            MovementAnims = ReplicatedStorage:WaitForChild("Assets", 10):WaitForChild("ReplicatedAnims", 10):WaitForChild("Movement", 10)
+            if game:GetService("UserInputService"):IsKeyDown(Enum.KeyCode.S) then
+                move -= cam.CFrame.LookVector
+            end
+            if game:GetService("UserInputService"):IsKeyDown(Enum.KeyCode.A) then
+                move -= cam.CFrame.RightVector
+            end
+            if game:GetService("UserInputService"):IsKeyDown(Enum.KeyCode.D) then
+                move += cam.CFrame.RightVector
+            end
+            if game:GetService("UserInputService"):IsKeyDown(Enum.KeyCode.Space) then
+                move += Vector3.new(0, 1, 0)
+            end
+            bv.Velocity = move * (speed or 50)
         end)
-        if not ok then
-            DiveRemote = nil
-            warn("[AutoDive] no encontré los remotes del juego:", err)
-            return
-        end
-    end
-    if not running then return end
-
-    local animator = humanoid:FindFirstChildOfClass("Animator") or humanoid
-    animTracks = {}
-    for _, name in ipairs({ "DiveL", "DiveR" }) do
-        local anim = MovementAnims:FindFirstChild(name)
-        if anim then animTracks[name] = animator:LoadAnimation(anim) end
-    end
-    ready = true
-end
-
--- Detección: devuelve una tabla si el balón va hacia el arco
-local function incoming(b)
-    local vel = b.AssemblyLinearVelocity
-    if vel.Magnitude < Cfg.MinSpeed then return end
-
-    local cf = rootPart.CFrame
-    local relVel = cf:VectorToObjectSpace(vel)
-    local relPos = cf:PointToObjectSpace(b.Position)
-
-    -- debe acercarse de frente (se tolera un balón apenas a la altura del portero)
-    local ahead = -relPos.Z
-    if relVel.Z <= REL_VEL_Z_MIN or ahead < -BEHIND_TOL then return end
-
-    local t = math.max(math.max(ahead, 0) / relVel.Z, 0.03)
-    if t > Cfg.MaxTime then return end
-
-    -- altura al llegar. Si el balón rueda, o caería al suelo antes de llegar
-    -- (rebota y sigue), se trata como tiro raso en vez de descartarlo
-    local y0 = b.Position.Y
-    local restY = math.max(b.Size.Y * 0.5, 1)
-    local px = relPos.X + relVel.X * t
-    local py = y0 + vel.Y * t - 0.5 * workspace.Gravity * t * t
-    local grounded = false
-    if y0 < 4 and math.abs(vel.Y) < 10 then
-        grounded, py = true, y0
-    elseif py <= restY + 0.5 then
-        grounded, py = true, restY
-    end
-
-    if math.abs(px) < GOAL_WIDTH / 2 and py < 29 then
-        return { vel = vel, relVel = relVel, relPos = relPos, grounded = grounded, t = t, px = px, py = py }
-    end
-end
-
--- Lanzamiento
--- Distancia lateral que recorre el lanzamiento en T segundos con velocidad inicial v0
-local function disp(v0, T)
-    if T <= 0.08 then return v0 * T end
-    local t2 = T - 0.08
-    if v0 / DECEL_VAL >= t2 then
-        return v0 * T - 0.5 * DECEL_VAL * t2 * t2
-    end
-    return v0 * 0.08 + v0 * v0 / (2 * DECEL_VAL)
-end
-
--- Velocidad justa para recorrer d studs en T segundos (sin pasarse del balón)
-local function speedFor(d, T)
-    local lo, hi = 0, Cfg.MaxDiveSpeed
-    if disp(hi, T) <= d then return hi end
-    for _ = 1, 14 do
-        local mid = (lo + hi) / 2
-        if disp(mid, T) < d then lo = mid else hi = mid end
-    end
-    return hi
-end
-
-local function endDive(restore)
-    if diveConn then diveConn:Disconnect() diveConn = nil end
-    if diveBV then pcall(function() diveBV:Destroy() end) diveBV = nil end
-    if restore and rootPart and rootPart.Parent then
-        local v = rootPart.AssemblyLinearVelocity
-        rootPart.AssemblyLinearVelocity = Vector3.new(v.X * 0.25, math.min(v.Y, -14), v.Z * 0.25)
-        if humanoid then humanoid:ChangeState(Enum.HumanoidStateType.GettingUp) end
-    end
-    diving = false
-end
-
--- El servidor ve tu movimiento con retraso: se descuenta del tiempo útil
-local function latency()
-    local ok, p = pcall(function() return LP:GetNetworkPing() end)
-    if ok and type(p) == "number" then return math.clamp(p * Cfg.PingComp, 0, 0.3) end
-    return 0
-end
-
-local function performDive(b, info)
-    local now = tick()
-    if diving or not ready or now - lastDive < Cfg.Cooldown then return end
-    diving, lastDive = true, now
-
-    local root, vel, relVel, relPos = rootPart, info.vel, info.relVel, info.relPos
-    local g = workspace.Gravity
-
-    -- datos para el servidor
-    local pTime = math.clamp(math.abs(relPos.Z / math.max(math.abs(relVel.Z), 0.5)), 0.01, 1.5)
-    local targetPos = b.Position + vel * pTime
-    if info.grounded then
-        targetPos = Vector3.new(targetPos.X, info.py, targetPos.Z)
     else
-        targetPos = targetPos + Vector3.new(0, -0.5 * g * pTime * pTime, 0)
+        if flyConnection then
+            flyConnection:Disconnect()
+            flyConnection = nil
+        end
+        local bv = hrp:FindFirstChild("FlyBV")
+        if bv then bv:Destroy() end
     end
+end
 
-    local currentRelY = b.Position.Y - root.Position.Y
-    local predictedRelY = targetPos.Y - root.Position.Y
-    local isAirShot = not info.grounded and ((predictedRelY > 4) or (currentRelY > 4))
+return PlayerEnhancer
 
-    -- lateral: solo lo necesario para quedar en la trayectoria del balón a tiempo
-    local T = math.clamp(info.t - latency(), 0.08, NUDGE_DURATION)
-    local dir = info.px >= 0 and 1 or -1
-    local velX = dir * speedFor(math.abs(info.px) + Cfg.ExtraReach, T)
-    local animName, dirKey = "DiveL", "l"
-    if dir > 0 then animName, dirKey = "DiveR", "r" end
+-- Modules/BallController.lua
+local BallController = {}
 
-    -- vertical: tiros altos como antes; a ras de suelo, a la altura del balón
-    local diveV, grav
-    if isAirShot then
-        diveV = math.clamp(AIR_DIVE_MIN + math.max(currentRelY, predictedRelY) * 2.5, AIR_DIVE_MIN, AIR_DIVE_MAX)
-        grav = AIR_GRAVITY
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local player = Players.LocalPlayer
+
+-- Referencia al servicio del balón (según scripts públicos)
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local BallService = ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Knit"):WaitForChild("Services"):WaitForChild("BallService")
+local BallRE = BallService:WaitForChild("RE")
+
+-- Encuentra el balón en el workspace
+local function getFootball()
+    for _, obj in pairs(workspace:GetChildren()) do
+        if obj:IsA("Model") and obj.Name == "Football" then
+            return obj
+        end
+    end
+    return nil
+end
+
+-- Teleport al balón
+function BallController.teleportToBall()
+    local char = player.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    local ball = getFootball()
+    if ball and ball:FindFirstChild("Handle") then
+        hrp.CFrame = ball.Handle.CFrame + Vector3.new(0, 5, 0)
+    end
+end
+
+-- Auto‑Goal: cuando el jugador tiene el balón, lo envía a la portería
+function BallController.setAutoGoal(enabled)
+    if enabled then
+        -- Lógica basada en el script público: tween hacia la portería
+        -- (Se simplifica para evitar errores si la portería no existe)
+        local char = player.Character
+        if not char then return end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        -- Buscar portería (nombre típico "HomeGK" o "AwayGK")
+        local goals = workspace:FindFirstChild("Goals")
+        if goals then
+            local target = goals:FindFirstChild("HomeGK") or goals:FindFirstChild("AwayGK")
+            if target then
+                local tweenInfo = TweenInfo.new(0.5, Enum.EasingStyle.Linear)
+                local tween = TweenService:Create(hrp, tweenInfo, {CFrame = target.CFrame})
+                tween:Play()
+            end
+        end
+    end
+end
+
+-- Auto‑Steal: posicionamiento predictivo (simplificado)
+function BallController.setAutoSteal(enabled)
+    if enabled then
+        local ball = getFootball()
+        if ball and ball:FindFirstChild("Handle") then
+            local char = player.Character
+            if char and char:FindFirstChild("HumanoidRootPart") then
+                char.HumanoidRootPart.CFrame = ball.Handle.CFrame + Vector3.new(0, 0, 3)
+            end
+        end
+    end
+end
+
+return BallController
+
+-- Modules/ESP.lua
+local ESP = {}
+
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+-- Resaltado del balón
+function ESP.setBallESP(enabled)
+    local ball = workspace:FindFirstChild("Football")
+    if not ball then return end
+    if enabled then
+        local highlight = ball:FindFirstChild("BallHighlight") or Instance.new("Highlight")
+        highlight.Name = "BallHighlight"
+        highlight.FillColor = Color3.fromRGB(255, 215, 0)
+        highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+        highlight.Parent = ball
     else
-        grav = GROUND_GRAVITY
-        local h = math.clamp(info.py - root.Position.Y, -3, 4)
-        diveV = math.clamp((h + 0.5 * grav * T * T) / T, 0, GROUND_VERTICAL)
+        local highlight = ball:FindFirstChild("BallHighlight")
+        if highlight then highlight:Destroy() end
     end
+end
 
-    pcall(function() StaminaRemote:FireServer(10) end)
-    pcall(function() DiveRemote:FireServer(targetPos, pTime, dirKey) end)
-
-    local anim = animTracks[animName]
-    if anim then
-        anim.Priority = Enum.AnimationPriority.Action4
-        anim:Play(0, 1, math.clamp(1.4 * NUDGE_DURATION / math.max(T, 0.25), 1.4, 2.2))
-    end
-
-    humanoid:ChangeState(Enum.HumanoidStateType.Physics)
-
-    endDive(false)
-    diving = true
-    local bv = Instance.new("BodyVelocity")
-    bv.MaxForce = Vector3.new(1, 1, 1) * 2500000
-    bv.Parent = root
-    diveBV = bv
-
-    root.AssemblyLinearVelocity = root.CFrame:VectorToWorldSpace(Vector3.new(velX, 0, 0)) + Vector3.new(0, diveV, 0)
-
-    local startTime = tick()
-    local vx, vv = velX, diveV
-    diveConn = RunService.Heartbeat:Connect(function(dt)
-        if not running or not root.Parent or not bv.Parent or humanoid.Health <= 0 then
-            endDive(false)
-            return
+-- ESP de jugadores (cajas simples usando Highlight)
+function ESP.setPlayerESP(enabled)
+    for _, other in pairs(Players:GetPlayers()) do
+        if other ~= player and other.Character then
+            local char = other.Character
+            if enabled then
+                if not char:FindFirstChild("PlayerHighlight") then
+                    local hl = Instance.new("Highlight")
+                    hl.Name = "PlayerHighlight"
+                    hl.FillColor = Color3.fromRGB(255, 0, 0)
+                    hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                    hl.Parent = char
+                end
+            else
+                local hl = char:FindFirstChild("PlayerHighlight")
+                if hl then hl:Destroy() end
+            end
         end
-        local elapsed = tick() - startTime
-        if elapsed > NUDGE_DURATION then
-            endDive(true)
-            return
-        end
-        bv.Velocity = root.CFrame:VectorToWorldSpace(Vector3.new(vx, 0, 0)) + Vector3.new(0, vv, 0)
-        if elapsed > 0.08 then
-            local step = dt * DECEL_VAL
-            if vx > step then vx = vx - step elseif vx < -step then vx = vx + step else vx = 0 end
-        end
-        vv = vv - dt * grav
-    end)
-end
-
--- Control: botón ON/OFF, bucle principal y apagado
-local function refreshButton()
-    if not btn then return end
-    if not Cfg.Enabled then
-        btn.Text, btn.BackgroundColor3 = "Dive: OFF", Color3.fromRGB(75, 78, 95)
-    elseif areaOk then
-        btn.Text, btn.BackgroundColor3 = "Dive: ON", Color3.fromRGB(60, 190, 110)
-    else
-        btn.Text, btn.BackgroundColor3 = "Dive: fuera", Color3.fromRGB(200, 140, 40)
     end
 end
 
-local function toggle()
-    Cfg.Enabled = not Cfg.Enabled
-    print("[AutoDive]", Cfg.Enabled and "ON" or "OFF")
-    refreshButton()
+return ESP
+-- UI/RayfieldLoader.lua
+local RayfieldLoader = {}
+
+function RayfieldLoader.load()
+    local Rayfield = loadstring(game:HttpGet('https://raw.githubusercontent.com/shlexware/Rayfield/main/source'))()
+    return Rayfield
 end
 
-track(RunService.Heartbeat:Connect(function()
-    if not Cfg.Enabled or diving or not ready then return end
-    if not rootPart or not rootPart.Parent or humanoid.Health <= 0 then return end
+return RayfieldLoader
 
-    local ok = diveButtonAvailable()
-    if ok ~= areaOk then areaOk = ok refreshButton() end
-    if not ok then return end
+-- Main.lua
+-- Punto de entrada: carga la configuración, la UI y conecta los módulos.
 
-    local b = getBall()
-    if not b or (b.Position - rootPart.Position).Magnitude > Cfg.Range then return end
+local Config = require(script.Parent.Config)
+local Utilities = require(script.Parent.Modules.Utilities)
+local PlayerEnhancer = require(script.Parent.Modules.PlayerEnhancer)
+local BallController = require(script.Parent.Modules.BallController)
+local ESP = require(script.Parent.Modules.ESP)
+local RayfieldLoader = require(script.Parent.UI.RayfieldLoader)
 
-    local info = incoming(b)
-    if info then performDive(b, info) end
-end))
+-- Cargar valores guardados
+local currentConfig = Config.load()
 
-track(UIS.InputBegan:Connect(function(input, gpe)
-    if not gpe and input.KeyCode == Enum.KeyCode.F6 then toggle() end
-end))
+-- Cargar Rayfield
+local Rayfield = RayfieldLoader.load()
 
-if Cfg.ShowButton then
-    pcall(function()
-        gui = Instance.new("ScreenGui")
-        gui.Name = "ADToggle"
-        gui.ResetOnSpawn = false
-        gui.DisplayOrder = 999
-        btn = Instance.new("TextButton")
-        btn.Size = UDim2.fromOffset(92, 34)
-        btn.Position = UDim2.new(1, -102, 0, 70)
-        btn.AutoButtonColor = false
-        btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 13
-        btn.TextColor3 = Color3.new(1, 1, 1)
-        btn.Parent = gui
-        Instance.new("UICorner", btn)
-        refreshButton()
-        btn.Activated:Connect(toggle)
-        gui.Parent = LP:WaitForChild("PlayerGui", 5)
-    end)
-end
+-- Crear ventana principal
+local Window = Rayfield:CreateWindow({
+    Name = "Blue Lock: Rivals — Hub Profesional",
+    LoadingTitle = "Cargando módulos...",
+    LoadingSubtitle = "por tu nombre",
+    Theme = "Default",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "BlueLockRivals",
+        FileName = "Config"
+    },
+    KeySystem = false
+})
 
-function Cfg.stop()
-    running = false
-    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
-    if staminaConn then staminaConn:Disconnect() staminaConn = nil end
-    if diving then endDive(true) end
-    if gui then pcall(function() gui:Destroy() end) end
-    print("[AutoDive] detenido")
-end
+-- Pestaña "Jugador"
+local PlayerTab = Window:CreateTab("Jugador", 0)
+local PlayerSection = PlayerTab:CreateSection("Movimiento")
 
-task.spawn(setup)
-task.spawn(hookStamina)
-track(LP.CharacterAdded:Connect(function()
-    ready = false
-    task.wait(0.5)
-    if not running then return end
-    setup()
-    task.wait(1)
-    hookStamina()
-end))
+PlayerTab:CreateSlider({
+    Name = "WalkSpeed",
+    Range = {16, 100},
+    Increment = 1,
+    Suffix = "studs",
+    CurrentValue = currentConfig.WalkSpeed,
+    Flag = "WalkSpeed",
+    Callback = function(value)
+        currentConfig.WalkSpeed = value
+        PlayerEnhancer.setWalkSpeed(value)
+    end,
+})
 
-task.delay(15, function()
-    if running and Cfg.RequireButton and not everFound then
-        warn("[AutoDive] No he visto ningún botón con '" .. Cfg.DiveButtonName ..
-            "'. Si estás en el área, usa getgenv().AutoDive.listButtons() y cambia DiveButtonName.")
-    end
+PlayerTab:CreateSlider({
+    Name = "JumpPower",
+    Range = {50, 200},
+    Increment = 5,
+    Suffix = "power",
+    CurrentValue = currentConfig.JumpPower,
+    Flag = "JumpPower",
+    Callback = function(value)
+        currentConfig.JumpPower = value
+        PlayerEnhancer.setJumpPower(value)
+    end,
+})
+
+PlayerTab:CreateToggle({
+    Name = "Stamina Infinita",
+    CurrentValue = false,
+    Flag = "InfStamina",
+    Callback = function(state)
+        PlayerEnhancer.setInfiniteStamina(state)
+    end,
+})
+
+PlayerTab:CreateToggle({
+    Name = "Vuelo (Fly)",
+    CurrentValue = false,
+    Flag = "Fly",
+    Callback = function(state)
+        PlayerEnhancer.setFly(state, currentConfig.FlySpeed)
+    end,
+})
+
+PlayerTab:CreateSlider({
+    Name = "Velocidad de vuelo",
+    Range = {10, 200},
+    Increment = 5,
+    Suffix = "speed",
+    CurrentValue = currentConfig.FlySpeed,
+    Flag = "FlySpeed",
+    Callback = function(value)
+        currentConfig.FlySpeed = value
+    end,
+})
+
+-- Pestaña "Balón"
+local BallTab = Window:CreateTab("Balón", 0)
+local BallSection = BallTab:CreateSection("Control del balón")
+
+BallTab:CreateButton({
+    Name = "Teleport al balón",
+    Callback = function()
+        BallController.teleportToBall()
+    end,
+})
+
+BallTab:CreateToggle({
+    Name = "Auto‑Goal (con posesión)",
+    CurrentValue = false,
+    Flag = "AutoGoal",
+    Callback = function(state)
+        BallController.setAutoGoal(state)
+    end,
+})
+
+BallTab:CreateToggle({
+    Name = "Auto‑Steal",
+    CurrentValue = false,
+    Flag = "AutoSteal",
+    Callback = function(state)
+        BallController.setAutoSteal(state)
+    end,
+})
+
+-- Pestaña "Visuales"
+local VisualTab = Window:CreateTab("Visuales", 0)
+local VisualSection = VisualTab:CreateSection("ESP y entorno")
+
+VisualTab:CreateToggle({
+    Name = "Ball ESP",
+    CurrentValue = currentConfig.BallESP,
+    Flag = "BallESP",
+    Callback = function(state)
+        currentConfig.BallESP = state
+        ESP.setBallESP(state)
+    end,
+})
+
+VisualTab:CreateToggle({
+    Name = "Player ESP",
+    CurrentValue = currentConfig.PlayerESP,
+    Flag = "PlayerESP",
+    Callback = function(state)
+        currentConfig.PlayerESP = state
+        ESP.setPlayerESP(state)
+    end,
+})
+
+VisualTab:CreateToggle({
+    Name = "FullBright",
+    CurrentValue = currentConfig.FullBright,
+    Flag = "FullBright",
+    Callback = function(state)
+        currentConfig.FullBright = state
+        Utilities.setFullBright(state)
+    end,
+})
+
+-- Pestaña "Utilidades"
+local UtilTab = Window:CreateTab("Utilidades", 0)
+local UtilSection = UtilTab:CreateSection("Varios")
+
+UtilTab:CreateToggle({
+    Name = "Anti‑AFK",
+    CurrentValue = currentConfig.AntiAFK,
+    Flag = "AntiAFK",
+    Callback = function(state)
+        currentConfig.AntiAFK = state
+        Utilities.setAntiAFK(state)
+    end,
+})
+
+UtilTab:CreateButton({
+    Name = "Teleport a Spawn",
+    Callback = function()
+        Utilities.teleportToSpawn()
+    end,
+})
+
+-- Guardar configuración al cerrar (Rayfield ya lo hace automáticamente,
+-- pero forzamos un guardado manual por si acaso)
+game:GetService("Players").LocalPlayer.OnTeleport:Connect(function()
+    Config.save(currentConfig)
 end)
 
-print("[AutoDive] v4 cargado | F6 o botón = ON/OFF")
+Rayfield:Notify({
+    Title = "Blue Lock: Rivals Hub",
+    Content = "Script cargado correctamente. Usa las pestañas para configurar.",
+    Duration = 5,
+    Image = nil,
+})
