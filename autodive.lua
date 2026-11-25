@@ -149,6 +149,101 @@ local function setCam(on)
             function(dt) pcall(camStep, dt) end)
     end
 end
+--== FEATURE 4: ANTI-RAGDOLL ==-----------------------------------------
+local antiRagConn = nil
+local antiRagCached = {}
+
+local function cacheChar()
+    local char = me.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not (hum and root) then return false end
+    antiRagCached = { character = char, humanoid = hum, root = root }
+    return true
+end
+
+local function isRagdolled()
+    local hum = antiRagCached.humanoid
+    if not hum then return false end
+    local state = hum:GetState()
+    return state == Enum.HumanoidStateType.Physics
+        or state == Enum.HumanoidStateType.Ragdoll
+        or state == Enum.HumanoidStateType.FallingDown
+        or state == Enum.HumanoidStateType.GettingUp
+end
+
+local function cleanRagdoll()
+    local char = antiRagCached.character
+    if not char then return end
+    for _, v in ipairs(char:GetDescendants()) do
+        if v:IsA("BallSocketConstraint")
+           or (v:IsA("Attachment") and v.Name:find("RagdollAttachment")) then
+            pcall(function() v:Destroy() end)
+        end
+    end
+end
+
+local function forceExit()
+    local hum = antiRagCached.humanoid
+    local root = antiRagCached.root
+    if not (hum and root) then return end
+    pcall(function()
+        me:SetAttribute("RagdollEndTime", workspace:GetServerTimeNow())
+    end)
+    if hum.Health > 0 then
+        pcall(function()
+            hum:ChangeState(Enum.HumanoidStateType.Running)
+        end)
+    end
+    pcall(function()
+        root.Anchored = false
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        root.CFrame = CFrame.new(root.Position)
+            * CFrame.Angles(0, math.rad(root.Orientation.Y), 0)
+    end)
+    local cam = workspace.CurrentCamera
+    if cam and cam.CameraSubject ~= hum then
+        pcall(function() cam.CameraSubject = hum end)
+    end
+end
+
+local function antiRagLoop()
+    if not antiRagCached.humanoid or not antiRagCached.humanoid.Parent then
+        if not cacheChar() then return end
+    end
+    if isRagdolled() then
+        cleanRagdoll()
+        forceExit()
+    end
+end
+
+local function startAntiRag()
+    if antiRagConn then antiRagConn:Disconnect() end
+    if not cacheChar() then
+        -- Si aún no hay personaje, reintenta cuando aparezca
+        link(me.CharacterAdded:Connect(function()
+            task.wait(0.5)
+            if Features["antiragg"] and Features["antiragg"].enabled then
+                startAntiRag()
+            end
+        end))
+        return
+    end
+    antiRagConn = RunService.RenderStepped:Connect(antiRagLoop)
+end
+
+local function stopAntiRag()
+    if antiRagConn then antiRagConn:Disconnect(); antiRagConn = nil end
+    antiRagCached = {}
+end
+
+register("antiragg", {
+    onEnable  = startAntiRag,
+    onDisable = stopAntiRag,
+})
+addToggle("Anti-Ragdoll", "antiragg")
 
 --== GESTOR DE FEATURES ==----------------------------------------------
 local Features = {}
@@ -324,3 +419,4 @@ register("sprint", {
 
 -- 2) Añadir el toggle en la UI
 addToggle("Sprint infinito", "sprint")
+
