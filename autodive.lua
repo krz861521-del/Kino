@@ -1,5 +1,5 @@
---[[ BLR HUB v1 · Blue Lock: Rivals
-     Auto Steal (remote) + Grab Ball + Cámara al balón
+--[[ BLR HUB v1.1 · Blue Lock: Rivals
+     Auto Steal (remote) + Grab Ball + Cámara al balón + Anti-Ragdoll
      Todo en un solo menú con toggles que se guardan ]]
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
@@ -130,9 +130,30 @@ end
 
 --== FEATURE 3: CÁMARA ==-----------------------------------------------
 local CAM = "BLRHubCam"
+local function camStep(dt)
+    local cam = workspace.CurrentCamera
+    local _, b = getBallOwner()
+    if not (cam and b) then return end
+    local cf = cam.CFrame
+    local flat = (b.Position - cf.Position) * FLAT
+    if flat.Magnitude < 3 then return end
+    local y = cf.LookVector.Y
+    local goal = flat.Unit * math.sqrt(math.max(0, 1-y*y)) + Vector3.new(0, y, 0)
+    local a = 1 - (1 - K.pulls[cfg.pull]) ^ (math.max(dt, 0.001) * 60)
+    cam.CFrame = cf:Lerp(CFrame.lookAt(cf.Position, cf.Position + goal), math.clamp(a, 0, 1))
+end
+local function setCam(on)
+    pcall(function() RunService:UnbindFromRenderStep(CAM) end)
+    if on then
+        RunService:BindToRenderStep(CAM, Enum.RenderPriority.Camera.Value + 1,
+            function(dt) pcall(camStep, dt) end)
+    end
+end
+
 --== FEATURE 4: ANTI-RAGDOLL ==-----------------------------------------
 local antiRagConn = nil
 local antiRagCached = {}
+local antiRagReconnect = nil
 
 local function cacheChar()
     local char = me.Character
@@ -147,7 +168,8 @@ end
 local function isRagdolled()
     local hum = antiRagCached.humanoid
     if not hum then return false end
-    local state = hum:GetState()
+    local ok, state = pcall(function() return hum:GetState() end)
+    if not ok then return false end
     return state == Enum.HumanoidStateType.Physics
         or state == Enum.HumanoidStateType.Ragdoll
         or state == Enum.HumanoidStateType.FallingDown
@@ -159,27 +181,25 @@ local function cleanRagdoll()
     if not char then return end
     for _, v in ipairs(char:GetDescendants()) do
         if v:IsA("BallSocketConstraint")
-           or (v:IsA("Attachment") and v.Name:find("RagdollAttachment")) then
+        or (v:IsA("Attachment") and v.Name:find("RagdollAttachment")) then
             pcall(function() v:Destroy() end)
         end
     end
 end
 
 local function forceExit()
-    local hum = antiRagCached.humanoid
+    local hum  = antiRagCached.humanoid
     local root = antiRagCached.root
     if not (hum and root) then return end
     pcall(function()
         me:SetAttribute("RagdollEndTime", workspace:GetServerTimeNow())
     end)
     if hum.Health > 0 then
-        pcall(function()
-            hum:ChangeState(Enum.HumanoidStateType.Running)
-        end)
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
     end
     pcall(function()
         root.Anchored = false
-        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyLinearVelocity  = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
         root.CFrame = CFrame.new(root.Position)
             * CFrame.Angles(0, math.rad(root.Orientation.Y), 0)
@@ -201,48 +221,30 @@ local function antiRagLoop()
 end
 
 local function startAntiRag()
-    if antiRagConn then antiRagConn:Disconnect() end
+    if antiRagConn then antiRagConn:Disconnect(); antiRagConn = nil end
+    if antiRagReconnect then antiRagReconnect:Disconnect(); antiRagReconnect = nil end
     if not cacheChar() then
-        -- Si aún no hay personaje, reintenta cuando aparezca
-        link(me.CharacterAdded:Connect(function()
+        -- Aún sin personaje: esperamos a que reaparezca
+        antiRagReconnect = me.CharacterAdded:Connect(function()
             task.wait(0.5)
             if Features["antiragg"] and Features["antiragg"].enabled then
                 startAntiRag()
             end
-        end))
+        end)
         return
     end
     antiRagConn = RunService.RenderStepped:Connect(antiRagLoop)
+    -- También re-cachea si mueres y reapareces
+    antiRagReconnect = me.CharacterAdded:Connect(function()
+        task.wait(0.5)
+        cacheChar()
+    end)
 end
 
 local function stopAntiRag()
     if antiRagConn then antiRagConn:Disconnect(); antiRagConn = nil end
+    if antiRagReconnect then antiRagReconnect:Disconnect(); antiRagReconnect = nil end
     antiRagCached = {}
-end
-
-register("antiragg", {
-    onEnable  = startAntiRag,
-    onDisable = stopAntiRag,
-})
-addToggle("Anti-Ragdoll", "antiragg")
-local function camStep(dt)
-    local cam = workspace.CurrentCamera
-    local _, b = getBallOwner()
-    if not (cam and b) then return end
-    local cf = cam.CFrame
-    local flat = (b.Position - cf.Position) * FLAT
-    if flat.Magnitude < 3 then return end
-    local y = cf.LookVector.Y
-    local goal = flat.Unit * math.sqrt(math.max(0, 1-y*y)) + Vector3.new(0, y, 0)
-    local a = 1 - (1 - K.pulls[cfg.pull]) ^ (math.max(dt, 0.001) * 60)
-    cam.CFrame = cf:Lerp(CFrame.lookAt(cf.Position, cf.Position + goal), math.clamp(a, 0, 1))
-end
-local function setCam(on)
-    pcall(function() RunService:UnbindFromRenderStep(CAM) end)
-    if on then
-        RunService:BindToRenderStep(CAM, Enum.RenderPriority.Camera.Value + 1,
-            function(dt) pcall(camStep, dt) end)
-    end
 end
 
 --== GESTOR DE FEATURES ==----------------------------------------------
@@ -283,11 +285,12 @@ end
 register("autosteal", { loop = stealStep })
 register("cam", { loop = camStep, onEnable = function() setCam(true) end,
                                     onDisable = function() setCam(false) end })
+register("antiragg", { onEnable = startAntiRag, onDisable = stopAntiRag })
 
 --== UI ==--------------------------------------------------------------
 local gui = mk("ScreenGui", { Name="BLRHub", ResetOnSpawn=false, DisplayOrder=35 })
 local panel = corner(mk("Frame", {
-    Size = UDim2.fromOffset(260, 260), Position = UDim2.new(0, 12, 0.4, 0),
+    Size = UDim2.fromOffset(260, 300), Position = UDim2.new(0, 12, 0.4, 0),
     BackgroundColor3 = C.bg, BorderSizePixel = 0, Active = true,
 }, gui), 12)
 mk("UIStroke", { Color = C.acc, Thickness = 1.5, Transparency = 0.4 }, panel)
@@ -362,6 +365,7 @@ end
 
 addToggle("Auto Steal", "autosteal")
 addToggle("Cámara al balón", "cam")
+addToggle("Anti-Ragdoll", "antiragg")
 
 -- botón ciclar cámara
 local camBtn = corner(mk("TextButton", { Text = "", Font = Enum.Font.GothamBold, TextSize = 12,
@@ -388,6 +392,7 @@ local function unload()
         for _, c in ipairs(f.connections or {}) do pcall(function() c:Disconnect() end) end
     end
     setCam(false)
+    stopAntiRag()
     pcall(function() gui:Destroy() end)
     ENV.HUB = nil
     print("[Hub] descargado")
@@ -404,19 +409,4 @@ if not parent then parent = me:WaitForChild("PlayerGui") end
 gui.Parent = parent
 
 ENV.HUB = { unload = unload, toggle = toggleFeature, features = Features, grab = grab }
-print("[Hub] listo")
--- 1) Registrar la función
-register("sprint", {
-    onEnable = function()
-        local h = humOf(me)
-        if h then h.WalkSpeed = 40 end
-    end,
-    onDisable = function()
-        local h = humOf(me)
-        if h then h.WalkSpeed = 16 end
-    end,
-})
-
--- 2) Añadir el toggle en la UI
-addToggle("Sprint infinito", "sprint")
-
+print("[Hub] listo · Anti-Ragdoll incluido")
