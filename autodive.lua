@@ -1,412 +1,588 @@
---[[ BLR HUB v1.1 · Blue Lock: Rivals
-     Auto Steal (remote) + Grab Ball + Cámara al balón + Anti-Ragdoll
-     Todo en un solo menú con toggles que se guardan ]]
-local Players      = game:GetService("Players")
-local RunService   = game:GetService("RunService")
-local UIS          = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local HttpService  = game:GetService("HttpService")
+--[[
+    AUTO AIM v1 — Asistencia de tiro para Blue Lock: Rivals
+    Cuando estás cerca de la portería y tienes el balón, el tiro se redirige a un punto
+    aleatorio del marco: escuadras, esquinas bajas o centro.
 
-local me  = Players.LocalPlayer
-local ENV = getgenv and getgenv() or _G
-if ENV.HUB and ENV.HUB.unload then pcall(ENV.HUB.unload) end
+    Cómo funciona: intercepta el RemoteEvent de disparo (Shoot / shoot_event) y reescribe
+    el vector/posición/CFrame objetivo antes de enviarlo al servidor.
 
---== CONFIG ==----------------------------------------------------------
-local C = {
-    bg=Color3.fromRGB(14,16,26),   card=Color3.fromRGB(30,33,48),
-    txt=Color3.fromRGB(235,238,248), mut=Color3.fromRGB(140,146,170),
-    acc=Color3.fromRGB(60,120,255), off=Color3.fromRGB(58,62,84),
-    ok =Color3.fromRGB(80,220,140), warn=Color3.fromRGB(255,180,60),
+    Importante: no conozco los argumentos exactos de esos remotos. El modo "auto" usa una
+    heurística. Si el tiro no se desvía, pon Debug = true, dispara una vez, mira en la
+    consola qué argumentos manda el juego y ajusta ArgMode / ArgIndex.
+
+    API: getgenv().AutoAim.Enabled = true/false | .preview() | .setRange(n) | .stop()
+]]
+
+--==========================================================================
+-- 1. SERVICIOS
+--==========================================================================
+local function getService(name)
+    local ok, svc = pcall(function() return game:GetService(name) end)
+    return ok and svc or nil
+end
+
+local Players = getService("Players")
+local RunService = getService("RunService")
+local UIS = getService("UserInputService")
+local Workspace = getService("Workspace")
+local LP = Players and Players.LocalPlayer
+if not (Players and RunService and UIS and Workspace and LP) then
+    warn("[AutoAim] no pude acceder a los servicios de Roblox")
+    return
+end
+
+-- Si ya había una copia corriendo, se apaga antes de empezar
+if getgenv().AutoAim and getgenv().AutoAim.stop then
+    pcall(getgenv().AutoAim.stop)
+end
+
+--==========================================================================
+-- 2. CONFIGURACIÓN
+--==========================================================================
+local Cfg = {
+    Enabled = true,
+
+    -- Distancia (studs, en horizontal) a la portería para que la ayuda se active
+    MinDistance = 15,
+    MaxDistance = 60,
+    SliderMin = 30,            -- límites del deslizador de la GUI para MaxDistance
+    SliderMax = 120,
+
+    -- Búsqueda de la portería (nombres en minúsculas)
+    GoalNames = { "goal", "goals", "rim", "arco", "porteria" },
+    PartialMatch = false,      -- true = basta con que el nombre contenga alguno
+    RequireFacing = true,      -- solo la portería que tienes delante (cámara)
+    FacingDot = 0.2,           -- 1 = justo de frente, 0 = de lado
+
+    -- Balón y posesión
+    BallName = "Football",
+    PossessionDistance = 9,    -- si el juego no marca dueño, "tienes el balón" = estar a esta distancia
+    OwnerKeys = { "Owner", "Possessor", "Holder", "BallOwner" },   -- atributos/valores que se revisan
+    HasBallCheck = nil,        -- opcional: function(ball, root) return true/false end
+
+    -- Remotos de disparo (por nombre; sirve para el sistema Legacy y el nuevo)
+    RemoteNames = { Shoot = true, shoot_event = true },
+    ArgMode = "auto",          -- "auto" | "direction" | "position"
+    ArgIndex = nil,            -- número de argumento a reescribir (nil = automático)
+    AimStrength = 1,           -- 1 = va exacto al punto; 0.7 = mezcla con tu tiro original
+    ShotWindow = 0.35,         -- si el juego manda 2 remotos por tiro, ambos usan el mismo punto
+
+    -- Puntos de destino. u: -0.5 (izquierda) a 0.5 (derecha) | v: 0 (césped) a 1 (travesaño)
+    Targets = {
+        { name = "Escuadra izquierda", u = -0.40, v = 0.86, weight = 1.0 },
+        { name = "Escuadra derecha",   u =  0.40, v = 0.86, weight = 1.0 },
+        { name = "Inferior izquierda", u = -0.36, v = 0.14, weight = 1.0 },
+        { name = "Inferior derecha",   u =  0.36, v = 0.14, weight = 1.0 },
+        { name = "Centro",             u =  0.00, v = 0.50, weight = 0.6 },
+    },
+    Jitter = 0.05,             -- variación aleatoria alrededor de cada punto
+    Margin = 0.06,             -- nunca más cerca que esto del borde del marco
+    DepthFactor = 0,           -- 0 = centro del marco; >0 = más adentro de la red
+
+    -- Alternativa sin hook: apunta la cámara al pulsar disparo (experimental)
+    InputFallback = true,
+    ShootInputs = { Enum.UserInputType.MouseButton1 },
+
+    ShowGui = true,
+    Debug = false,
 }
-local K = {
-    range = 12, carrier = 8, facing = 0.5, cooldown = 1.2,
-    grabKey = Enum.KeyCode.G, grabTime = 6,
-    pulls = { 0.25, 0.5, 1 },
-    file = "BLR_Hub.json",
+getgenv().AutoAim = Cfg
+
+--==========================================================================
+-- 3. ESTADO
+--==========================================================================
+local running = true
+local conns = {}
+local rng = Random.new(os.time())
+local hooked = false
+
+local State = {
+    ready = false,             -- ¿se cumplen todas las condiciones ahora mismo?
+    status = "Iniciando",
+    root = nil, ball = nil, ballRoot = nil,
+    goal = nil, frame = nil,
+    preset = nil,              -- próximo destino ya elegido (aleatorio)
+    shotPoint = nil, shotAt = 0,
 }
+local goals = {}               -- [Instance] = true
+local boundsCache = {}
+local lastPreset
+local debugShots = 0
 
---== ESTADO PERSISTENTE ==---------------------------------------------
-local cfg = { features = {}, pull = 2 }
-pcall(function()
-    if isfile and readfile and isfile(K.file) then
-        local d = HttpService:JSONDecode(readfile(K.file))
-        cfg.features = d.features or {}
-        cfg.pull = math.clamp(tonumber(d.pull) or 2, 1, #K.pulls)
+local function track(c) conns[#conns + 1] = c return c end
+
+--==========================================================================
+-- 4. FUNCIONES AUXILIARES: PORTERÍA
+--==========================================================================
+local function nameMatches(n)
+    n = string.lower(n)
+    for _, key in ipairs(Cfg.GoalNames) do
+        if n == key or (Cfg.PartialMatch and string.find(n, key, 1, true)) then return true end
     end
-end)
-local function save()
-    if writefile then pcall(function() writefile(K.file, HttpService:JSONEncode(cfg)) end) end
+    return false
 end
 
---== UTIL ==------------------------------------------------------------
-local FLAT = Vector3.new(1,0,1)
-local cons, statusLbl = {}, nil
-local function link(c) cons[#cons+1] = c; return c end
-local function mk(cls, p, parent)
-    local o = Instance.new(cls)
-    for k,v in pairs(p) do pcall(function() o[k] = v end) end
-    o.Parent = parent; return o
-end
-local function corner(o, r) mk("UICorner", { CornerRadius = UDim.new(0, r) }, o); return o end
-local function say(t, col)
-    print("[Hub] "..t)
-    if statusLbl then statusLbl.Text = t; statusLbl.TextColor3 = col or C.mut end
-end
-local function rootOf(p) local c=p.Character; return c and c:FindFirstChild("HumanoidRootPart") end
-local function humOf(p)  local c=p.Character; return c and c:FindFirstChildOfClass("Humanoid") end
-local function isFoe(p)
-    if p == me then return false end
-    if p.Team and me.Team and p.Team == me.Team then return false end
-    return true
-end
-
---== BALÓN + REMOTE ==--------------------------------------------------
-local BallService
-pcall(function()
-    BallService = game:GetService("ReplicatedStorage"):WaitForChild("Packages", 5)
-        :WaitForChild("Knit", 5):WaitForChild("Services", 5)
-        :WaitForChild("BallService", 5):WaitForChild("RE", 5)
-end)
-local function getBallOwner()
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p.Character then
-            local f = p.Character:FindFirstChild("Football")
-            if f and f:IsA("BasePart") then return p, f end
-        end
+-- Registra una portería. Si hay un modelo "Goal" con piezas "Goal" dentro, se queda el modelo.
+local function considerGoal(inst)
+    if goals[inst] then return end
+    local okType = inst:IsA("BasePart") or inst:IsA("Model")
+    if not (okType and nameMatches(inst.Name)) then return end
+    local p = inst.Parent
+    while p and p ~= Workspace do
+        if goals[p] then return end
+        p = p.Parent
     end
-    return nil, nil
+    for g in pairs(goals) do
+        if g:IsDescendantOf(inst) then goals[g] = nil boundsCache[g] = nil end
+    end
+    goals[inst] = true
 end
 
---== FEATURE 1: AUTO STEAL ==-------------------------------------------
-local lastSteal = -1e9
-local function stealStep()
-    if not BallService then return end
-    local r0 = rootOf(me); if not r0 then return end
-    if os.clock() - lastSteal < K.cooldown then return end
-    local owner = getBallOwner()
-    if not owner or not isFoe(owner) then return end
-    local rt = rootOf(owner); if not rt then return end
-    local to = (rt.Position - r0.Position) * FLAT
-    local d = to.Magnitude
-    if d < 2 or d > K.range then return end
-    local look = r0.CFrame.LookVector * FLAT
-    if look.Magnitude < 0.05 then return end
-    if look.Unit:Dot(to.Unit) < K.facing then return end
-    lastSteal = os.clock()
-    say("Steal → "..owner.DisplayName, C.warn)
-    pcall(function() BallService.Slide:FireServer() end)
-end
-
---== FEATURE 2: GRAB BALL ==--------------------------------------------
-local chaseUntil, chasing = 0, false
-local rparams = RaycastParams.new(); rparams.FilterType = Enum.RaycastFilterType.Exclude
-local function grab()
-    if chaseUntil > os.clock() then chaseUntil = 0; say("Grab Ball cancelado"); return end
-    local _, b = getBallOwner()
-    if not b then say("No hay pelota", C.warn); return end
-    chaseUntil = os.clock() + K.grabTime
-    say("Corriendo...", C.acc)
-end
-local function grabStep()
-    local active = chaseUntil > os.clock()
-    local r0, h = rootOf(me), humOf(me)
-    if not (r0 and h) then return end
-    if active then
-        local _, b = getBallOwner()
-        if not b then chaseUntil = 0; return end
-        chasing = true
-        if (b.Position - r0.Position).Magnitude < 3.5 then
-            chaseUntil = 0
-            pcall(function() h:MoveTo(r0.Position) end)
-            chasing = false; say("Alcanzada", C.ok); return
-        end
-        local pred = b.Position + b.AssemblyLinearVelocity * 0.25
-        pcall(function() h:MoveTo(pred) end)
-    elseif chasing then
-        chasing = false
-        if r0 and h then pcall(function() h:MoveTo(r0.Position) end) end
+local function scanGoals()
+    local ok, list = pcall(function() return Workspace:GetDescendants() end)
+    if ok then
+        for _, d in ipairs(list) do pcall(considerGoal, d) end
     end
 end
 
---== FEATURE 3: CÁMARA ==-----------------------------------------------
-local CAM = "BLRHubCam"
-local function camStep(dt)
-    local cam = workspace.CurrentCamera
-    local _, b = getBallOwner()
-    if not (cam and b) then return end
-    local cf = cam.CFrame
-    local flat = (b.Position - cf.Position) * FLAT
-    if flat.Magnitude < 3 then return end
-    local y = cf.LookVector.Y
-    local goal = flat.Unit * math.sqrt(math.max(0, 1-y*y)) + Vector3.new(0, y, 0)
-    local a = 1 - (1 - K.pulls[cfg.pull]) ^ (math.max(dt, 0.001) * 60)
-    cam.CFrame = cf:Lerp(CFrame.lookAt(cf.Position, cf.Position + goal), math.clamp(a, 0, 1))
-end
-local function setCam(on)
-    pcall(function() RunService:UnbindFromRenderStep(CAM) end)
-    if on then
-        RunService:BindToRenderStep(CAM, Enum.RenderPriority.Camera.Value + 1,
-            function(dt) pcall(camStep, dt) end)
-    end
-end
-
---== FEATURE 4: ANTI-RAGDOLL ==-----------------------------------------
-local antiRagConn = nil
-local antiRagCached = {}
-local antiRagReconnect = nil
-
-local function cacheChar()
-    local char = me.Character
-    if not char then return false end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if not (hum and root) then return false end
-    antiRagCached = { character = char, humanoid = hum, root = root }
-    return true
-end
-
-local function isRagdolled()
-    local hum = antiRagCached.humanoid
-    if not hum then return false end
-    local ok, state = pcall(function() return hum:GetState() end)
-    if not ok then return false end
-    return state == Enum.HumanoidStateType.Physics
-        or state == Enum.HumanoidStateType.Ragdoll
-        or state == Enum.HumanoidStateType.FallingDown
-        or state == Enum.HumanoidStateType.GettingUp
-end
-
-local function cleanRagdoll()
-    local char = antiRagCached.character
-    if not char then return end
-    for _, v in ipairs(char:GetDescendants()) do
-        if v:IsA("BallSocketConstraint")
-        or (v:IsA("Attachment") and v.Name:find("RagdollAttachment")) then
-            pcall(function() v:Destroy() end)
-        end
-    end
-end
-
-local function forceExit()
-    local hum  = antiRagCached.humanoid
-    local root = antiRagCached.root
-    if not (hum and root) then return end
-    pcall(function()
-        me:SetAttribute("RagdollEndTime", workspace:GetServerTimeNow())
+-- CFrame y tamaño de una portería (con caché de 1 s)
+local function boundsOf(inst)
+    local c = boundsCache[inst]
+    local now = tick()
+    if c and now - c.t < 1 then return c.cf, c.size end
+    local ok, cf, size = pcall(function()
+        if inst:IsA("Model") then return inst:GetBoundingBox() end
+        return inst.CFrame, inst.Size
     end)
-    if hum.Health > 0 then
-        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
-    end
-    pcall(function()
-        root.Anchored = false
-        root.AssemblyLinearVelocity  = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        root.CFrame = CFrame.new(root.Position)
-            * CFrame.Angles(0, math.rad(root.Orientation.Y), 0)
-    end)
-    local cam = workspace.CurrentCamera
-    if cam and cam.CameraSubject ~= hum then
-        pcall(function() cam.CameraSubject = hum end)
+    if ok and cf and size then
+        boundsCache[inst] = { t = now, cf = cf, size = size }
+        return cf, size
     end
 end
 
-local function antiRagLoop()
-    if not antiRagCached.humanoid or not antiRagCached.humanoid.Parent then
-        if not cacheChar() then return end
-    end
-    if isRagdolled() then
-        cleanRagdoll()
-        forceExit()
-    end
+local function flatUnit(v, fallback)
+    local f = Vector3.new(v.X, 0, v.Z)
+    if f.Magnitude < 0.01 then return fallback end
+    return f.Unit
 end
 
-local function startAntiRag()
-    if antiRagConn then antiRagConn:Disconnect(); antiRagConn = nil end
-    if antiRagReconnect then antiRagReconnect:Disconnect(); antiRagReconnect = nil end
-    if not cacheChar() then
-        -- Aún sin personaje: esperamos a que reaparezca
-        antiRagReconnect = me.CharacterAdded:Connect(function()
-            task.wait(0.5)
-            if Features["antiragg"] and Features["antiragg"].enabled then
-                startAntiRag()
+-- Ejes del marco: el lado horizontal más largo es el ancho; el otro, la profundidad
+local function frameOf(cf, size)
+    local right = flatUnit(cf.RightVector, Vector3.new(1, 0, 0))
+    local look = flatUnit(cf.LookVector, Vector3.new(0, 0, -1))
+    if size.X >= size.Z then
+        return { center = cf.Position, w = right, d = look, width = size.X, depth = size.Z, height = size.Y }
+    end
+    return { center = cf.Position, w = look, d = right, width = size.Z, depth = size.X, height = size.Y }
+end
+
+-- Elige la portería válida (distancia + de frente) más alineada con tu vista
+local function pickGoal(pos, lookVec)
+    local best, bestScore
+    for inst in pairs(goals) do
+        if inst.Parent then
+            local cf, size = boundsOf(inst)
+            if cf then
+                local flat = Vector3.new(cf.Position.X - pos.X, 0, cf.Position.Z - pos.Z)
+                local dist = flat.Magnitude
+                if dist >= Cfg.MinDistance and dist <= Cfg.MaxDistance then
+                    local facing = dist > 0.01 and lookVec:Dot(flat.Unit) or 1
+                    if (not Cfg.RequireFacing or facing >= Cfg.FacingDot) and (not bestScore or facing > bestScore) then
+                        best, bestScore = { inst = inst, cf = cf, size = size, dist = dist }, facing
+                    end
+                end
             end
-        end)
-        return
+        end
     end
-    antiRagConn = RunService.RenderStepped:Connect(antiRagLoop)
-    -- También re-cachea si mueres y reapareces
-    antiRagReconnect = me.CharacterAdded:Connect(function()
-        task.wait(0.5)
-        cacheChar()
+    return best
+end
+
+--==========================================================================
+-- 5. FUNCIONES AUXILIARES: OBJETIVO ALEATORIO
+--==========================================================================
+-- Elige un destino por peso, sin repetir el anterior (para que sea impredecible)
+local function rollPreset()
+    local total = 0
+    for _, t in ipairs(Cfg.Targets) do
+        if t ~= lastPreset then total = total + t.weight end
+    end
+    local r = rng:NextNumber() * total
+    for _, t in ipairs(Cfg.Targets) do
+        if t ~= lastPreset then
+            r = r - t.weight
+            if r <= 0 then lastPreset = t return t end
+        end
+    end
+    lastPreset = Cfg.Targets[1]
+    return lastPreset
+end
+
+-- Convierte un destino (u, v) en un punto 3D dentro del marco, visto desde el tirador
+local function targetPoint(frame, preset, shooterPos)
+    local toGoal = Vector3.new(frame.center.X - shooterPos.X, 0, frame.center.Z - shooterPos.Z)
+    local fwd = toGoal.Magnitude > 0.01 and toGoal.Unit or frame.d
+    local right = fwd:Cross(Vector3.new(0, 1, 0))      -- tu derecha
+    local w, d = frame.w, frame.d
+    if w:Dot(right) < 0 then w = -w end                -- +u siempre = tu derecha
+    if d:Dot(fwd) < 0 then d = -d end                  -- +profundidad = hacia la red
+
+    local m = Cfg.Margin
+    local u = math.clamp(preset.u + (rng:NextNumber() - 0.5) * 2 * Cfg.Jitter, -0.5 + m, 0.5 - m)
+    local v = math.clamp(preset.v + (rng:NextNumber() - 0.5) * 2 * Cfg.Jitter, m, 1 - m)
+    return frame.center
+        + w * (u * frame.width)
+        + Vector3.new(0, (v - 0.5) * frame.height, 0)
+        + d * (frame.depth * Cfg.DepthFactor)
+end
+
+-- Punto de este tiro. Si ya se pidió hace un instante (2 remotos por tiro), se reutiliza
+local function takeShotPoint()
+    local now = tick()
+    if State.shotPoint and now - State.shotAt < Cfg.ShotWindow then return State.shotPoint end
+    local preset = State.preset or rollPreset()
+    State.shotPoint = targetPoint(State.frame, preset, State.root.Position)
+    State.shotName, State.shotAt = preset.name, now
+    State.preset = nil              -- el siguiente tiro tendrá otro destino
+    return State.shotPoint
+end
+
+--==========================================================================
+-- 6. FUNCIONES AUXILIARES: BALÓN, POSESIÓN, DISTANCIA
+--==========================================================================
+local function getBall()
+    if State.ball and State.ball.Parent then return State.ball end
+    local f = Workspace:FindFirstChild(Cfg.BallName) or Workspace:FindFirstChild(Cfg.BallName, true)
+    if not f then return nil end
+    State.ball = f:IsA("BasePart") and f
+        or f:FindFirstChild("Hitbox") or f:FindFirstChild("BALL") or f:FindFirstChildWhichIsA("BasePart")
+    State.ballRoot = f
+    return State.ball
+end
+
+local function ownerMatches(v)
+    return v == LP or v == LP.Name or v == LP.UserId or (LP.Character ~= nil and v == LP.Character)
+end
+
+-- ¿Tienes el balón? Usa el dueño que marque el juego; si no hay, la distancia
+local function hasBall(root, ball)
+    if Cfg.HasBallCheck then
+        local ok, res = pcall(Cfg.HasBallCheck, ball, root)
+        if ok then return res and true or false end
+    end
+    for _, key in ipairs(Cfg.OwnerKeys) do
+        local attr = ball:GetAttribute(key)
+        if attr ~= nil then return ownerMatches(attr) end
+        local holder = ball:FindFirstChild(key) or (State.ballRoot and State.ballRoot:FindFirstChild(key))
+        if holder and holder:IsA("ValueBase") then return ownerMatches(holder.Value) end
+    end
+    return (ball.Position - root.Position).Magnitude <= Cfg.PossessionDistance
+end
+
+--==========================================================================
+-- 7. DETECCIÓN Y REDIRECCIÓN DEL DISPARO
+--==========================================================================
+local function describe(args)
+    local out = {}
+    for i = 1, args.n do out[i] = i .. "=" .. typeof(args[i]) .. ":" .. tostring(args[i]) end
+    return table.concat(out, " | ")
+end
+
+local function blend(original, desired) return original:Lerp(desired, Cfg.AimStrength) end
+
+-- Devuelve una copia de los argumentos con el destino sustituido (o nil si no hay qué cambiar)
+local function rewriteArgs(remote, args)
+    local point = takeShotPoint()
+    local origin = State.ball and State.ball.Position or State.root.Position
+    local desired = point - origin
+    if desired.Magnitude < 0.5 then return nil end
+
+    if Cfg.Debug and debugShots < 10 then
+        debugShots = debugShots + 1
+        print("[AutoAim] " .. remote.Name .. " -> " .. describe(args) .. " | destino: " .. (State.shotName or "?"))
+    end
+
+    local out = { n = args.n }
+    local changed = false
+    local positions = {}
+    for i = 1, args.n do
+        local a = args[i]
+        out[i] = a
+        if Cfg.ArgIndex == nil or Cfg.ArgIndex == i then
+            local t = typeof(a)
+            if t == "Vector3" then
+                local mag = a.Magnitude
+                local asDir = Cfg.ArgMode == "direction" or (Cfg.ArgMode == "auto" and mag > 0.5 and mag <= 1.5)
+                local asPos = Cfg.ArgMode == "position" or (Cfg.ArgMode == "auto" and mag > 1.5)
+                if asDir then
+                    out[i] = blend(a, desired.Unit).Unit
+                    changed = true
+                elseif asPos then
+                    positions[#positions + 1] = i
+                end
+            elseif t == "CFrame" then
+                out[i] = a:Lerp(CFrame.lookAt(a.Position, a.Position + desired), Cfg.AimStrength)
+                changed = true
+            end
+        end
+    end
+
+    -- Posiciones: en modo auto solo si hay una única y está lejos de ti (es un destino, no un origen)
+    if #positions > 0 then
+        local explicit = Cfg.ArgMode == "position" or Cfg.ArgIndex ~= nil
+        if explicit or (#positions == 1 and (args[positions[1]] - State.root.Position).Magnitude > 8) then
+            for _, i in ipairs(positions) do
+                out[i] = blend(args[i], point)
+                changed = true
+            end
+        end
+    end
+    return changed and out or nil
+end
+
+-- Hook al RemoteEvent: se ejecuta cada vez que el juego llama FireServer/InvokeServer
+local function installHook()
+    if not (hookmetamethod and getnamecallmethod) then return false end
+    local ok, err = pcall(function()
+        local old
+        local function handler(self, ...)
+            local method = getnamecallmethod()
+            if running and Cfg.Enabled and State.ready and typeof(self) == "Instance"
+                and (method == "FireServer" or method == "InvokeServer")
+                and Cfg.RemoteNames[self.Name] then
+                local cls = self.ClassName
+                if cls == "RemoteEvent" or cls == "RemoteFunction" then
+                    local okR, newArgs = pcall(rewriteArgs, self, table.pack(...))
+                    if okR and newArgs then
+                        return old(self, table.unpack(newArgs, 1, newArgs.n))
+                    end
+                end
+            end
+            return old(self, ...)
+        end
+        old = hookmetamethod(game, "__namecall", newcclosure and newcclosure(handler) or handler)
     end)
+    if not ok then warn("[AutoAim] no pude instalar el hook:", err) end
+    return ok
 end
 
-local function stopAntiRag()
-    if antiRagConn then antiRagConn:Disconnect(); antiRagConn = nil end
-    if antiRagReconnect then antiRagReconnect:Disconnect(); antiRagReconnect = nil end
-    antiRagCached = {}
-end
-
---== GESTOR DE FEATURES ==----------------------------------------------
-local Features = {}
-local function toggleFeature(name, state)
-    local f = Features[name]; if not f then return end
-    state = (state ~= nil) and state or not f.enabled
-    f.enabled = state; cfg.features[name] = state; save()
-    if state then
-        pcall(function() if f.onEnable then f.onEnable() end end)
-        if f.loop then
-            table.insert(f.connections, RunService.Heartbeat:Connect(function(dt)
-                pcall(f.loop, dt)
-            end))
-        end
-    else
-        for _, c in ipairs(f.connections) do pcall(function() c:Disconnect() end) end
-        f.connections = {}
-        pcall(function() if f.onDisable then f.onDisable() end end)
-    end
-end
-local function register(name, opts)
-    Features[name] = {
-        enabled = cfg.features[name] == true,
-        connections = {}, loop = opts.loop,
-        onEnable = opts.onEnable, onDisable = opts.onDisable,
-    }
-    if Features[name].enabled then
-        pcall(function() if opts.onEnable then opts.onEnable() end end)
-        if opts.loop then
-            table.insert(Features[name].connections, RunService.Heartbeat:Connect(function(dt)
-                pcall(opts.loop, dt)
-            end))
+-- Alternativa sin hook: al pulsar disparo, gira la cámara hacia el punto (experimental)
+local function onInput(input)
+    if hooked or not Cfg.InputFallback or not Cfg.Enabled or not State.ready then return end
+    for _, s in ipairs(Cfg.ShootInputs) do
+        if input.UserInputType == s or input.KeyCode == s then
+            local cam = Workspace.CurrentCamera
+            if cam then
+                local cur = cam.CFrame
+                cam.CFrame = cur:Lerp(CFrame.lookAt(cur.Position, takeShotPoint()), Cfg.AimStrength)
+            end
+            return
         end
     end
 end
 
-register("autosteal", { loop = stealStep })
-register("cam", { loop = camStep, onEnable = function() setCam(true) end,
-                                    onDisable = function() setCam(false) end })
-register("antiragg", { onEnable = startAntiRag, onDisable = stopAntiRag })
+--==========================================================================
+-- 8. BUCLE PRINCIPAL: evalúa las condiciones en cada frame
+--==========================================================================
+local function step()
+    State.ready = false
+    if not Cfg.Enabled then State.status = "Apagado" return end
 
---== UI ==--------------------------------------------------------------
-local gui = mk("ScreenGui", { Name="BLRHub", ResetOnSpawn=false, DisplayOrder=35 })
-local panel = corner(mk("Frame", {
-    Size = UDim2.fromOffset(260, 300), Position = UDim2.new(0, 12, 0.4, 0),
-    BackgroundColor3 = C.bg, BorderSizePixel = 0, Active = true,
-}, gui), 12)
-mk("UIStroke", { Color = C.acc, Thickness = 1.5, Transparency = 0.4 }, panel)
+    local char = LP.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum or hum.Health <= 0 then State.status = "Sin personaje" return end
+    State.root = root
 
-local head = mk("Frame", { Size = UDim2.new(1,0,0,30), BackgroundTransparency = 1, Active = true }, panel)
-mk("TextLabel", { Text = "⚽  BLR Hub", Font = Enum.Font.GothamBold, TextSize = 14,
-    TextColor3 = C.txt, TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
-    Position = UDim2.fromOffset(12,0), Size = UDim2.new(1,-50,1,0) }, head)
-statusLbl = mk("TextLabel", { Text = "Listo", Font = Enum.Font.Gotham, TextSize = 11,
-    TextColor3 = C.mut, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
-    BackgroundTransparency = 1, Position = UDim2.new(0,12,1,-18), Size = UDim2.new(1,-24,0,16) }, panel)
+    local ball = getBall()
+    if not ball then State.status = "Sin balón en el mapa" return end
 
--- drag
-local dragging, dS, dO = false, nil, nil
-link(head.InputBegan:Connect(function(i)
-    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-        dragging, dS, dO = true, i.Position, panel.Position
+    local cam = Workspace.CurrentCamera
+    local lookVec = flatUnit(cam and cam.CFrame.LookVector or root.CFrame.LookVector, Vector3.new(0, 0, -1))
+    local goal = pickGoal(root.Position, lookVec)
+    if not goal then State.status = "Fuera de rango" State.preset = nil return end
+    if not hasBall(root, ball) then State.status = "Sin balón" return end
+
+    if State.goal ~= goal.inst then State.goal = goal.inst State.preset = nil end
+    State.frame = frameOf(goal.cf, goal.size)
+    State.ready = true
+    State.status = string.format("Listo · %d st", math.floor(goal.dist + 0.5))
+    if not State.preset then State.preset = rollPreset() end
+end
+
+-- Muestra un destino de prueba (sin disparar) para comprobar que cae dentro del marco
+function Cfg.preview()
+    if not State.frame or not State.root then return nil end
+    local preset = rollPreset()
+    return preset.name, targetPoint(State.frame, preset, State.root.Position)
+end
+
+--==========================================================================
+-- 9. GUI DE CONTROL: botón ON/OFF + deslizador del rango
+--==========================================================================
+local gui, toggleBtn, rangeLabel, statusLabel, fill, knob
+
+local function setMaxDistance(v)
+    Cfg.MaxDistance = math.clamp(math.floor(v + 0.5), Cfg.SliderMin, Cfg.SliderMax)
+    if rangeLabel then rangeLabel.Text = "Rango máx: " .. Cfg.MaxDistance .. " st" end
+    if fill and knob then
+        local a = (Cfg.MaxDistance - Cfg.SliderMin) / (Cfg.SliderMax - Cfg.SliderMin)
+        fill.Size = UDim2.new(a, 0, 1, 0)
+        knob.Position = UDim2.new(a, 0, 0.5, 0)
     end
-end))
-link(UIS.InputChanged:Connect(function(i)
-    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
-        local d = i.Position - dS
-        panel.Position = UDim2.new(dO.X.Scale, dO.X.Offset + d.X, dO.Y.Scale, dO.Y.Offset + d.Y)
-    end
-end))
-link(UIS.InputEnded:Connect(function(i)
-    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-        dragging = false
-    end
-end))
+end
+Cfg.setRange = setMaxDistance
 
-local scroll = mk("ScrollingFrame", {
-    Size = UDim2.new(1,-16,1,-50), Position = UDim2.fromOffset(8,34),
-    BackgroundTransparency = 1, ScrollBarThickness = 3, ScrollBarImageColor3 = C.acc,
-    CanvasSize = UDim2.new(0,0,0,0),
-}, panel)
-local layout = mk("UIListLayout", { Padding = UDim.new(0,6), SortOrder = Enum.SortOrder.LayoutOrder }, scroll)
-layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-    scroll.CanvasSize = UDim2.new(0,0,0, layout.AbsoluteContentSize.Y + 8)
-end)
+local function refreshGui()
+    if not toggleBtn then return end
+    toggleBtn.Text = Cfg.Enabled and "Auto Aim: ON" or "Auto Aim: OFF"
+    toggleBtn.BackgroundColor3 = Cfg.Enabled and Color3.fromRGB(60, 190, 110) or Color3.fromRGB(75, 78, 95)
+    statusLabel.Text = State.status
+end
 
-local togglesUI = {}
-local function addToggle(text, name)
-    local r = corner(mk("Frame", { Size = UDim2.new(1,-4,0,34), BackgroundColor3 = C.card, BorderSizePixel = 0 }, scroll), 8)
-    mk("TextLabel", { Text = text, Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = C.txt,
-        TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
-        Position = UDim2.fromOffset(10,0), Size = UDim2.new(1,-70,1,0) }, r)
-    local track = corner(mk("TextButton", { Text = "", AutoButtonColor = false,
-        Size = UDim2.fromOffset(38,20), Position = UDim2.new(1,-46,0.5,-10),
-        BackgroundColor3 = C.off }, r), 10)
-    local knob = corner(mk("Frame", { Size = UDim2.fromOffset(14,14), Position = UDim2.fromOffset(3,3),
-        BackgroundColor3 = Color3.new(1,1,1), BorderSizePixel = 0 }, track), 7)
-    local function render()
-        local on = Features[name] and Features[name].enabled
-        TweenService:Create(track, TweenInfo.new(0.15), { BackgroundColor3 = on and C.acc or C.off }):Play()
-        TweenService:Create(knob, TweenInfo.new(0.15), { Position = UDim2.fromOffset(on and 21 or 3, 3) }):Play()
+local function buildGui()
+    gui = Instance.new("ScreenGui")
+    gui.Name = "AutoAimPanel"
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 997
+
+    local panel = Instance.new("Frame")
+    panel.Size = UDim2.fromOffset(190, 126)
+    panel.Position = UDim2.new(0, 10, 0.5, -63)
+    panel.BackgroundColor3 = Color3.fromRGB(22, 24, 32)
+    panel.BorderSizePixel = 0
+    panel.Parent = gui
+    Instance.new("UICorner", panel)
+
+    local function label(text, y, size, bold)
+        local l = Instance.new("TextLabel")
+        l.BackgroundTransparency = 1
+        l.Position = UDim2.fromOffset(10, y)
+        l.Size = UDim2.fromOffset(170, 16)
+        l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+        l.TextSize = size
+        l.TextColor3 = Color3.fromRGB(235, 235, 240)
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.Text = text
+        l.Parent = panel
+        return l
     end
-    render(); togglesUI[name] = render
-    link(track.Activated:Connect(function()
-        toggleFeature(name)
-        for _, f in pairs(togglesUI) do pcall(f) end
-        say(text..(Features[name].enabled and " ON" or " OFF"),
-            Features[name].enabled and C.ok or C.mut)
+
+    label("Auto Aim", 6, 13, true)
+
+    toggleBtn = Instance.new("TextButton")
+    toggleBtn.Position = UDim2.fromOffset(10, 28)
+    toggleBtn.Size = UDim2.fromOffset(170, 28)
+    toggleBtn.AutoButtonColor = false
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.TextSize = 12
+    toggleBtn.TextColor3 = Color3.new(1, 1, 1)
+    toggleBtn.Parent = panel
+    Instance.new("UICorner", toggleBtn)
+    toggleBtn.Activated:Connect(function()
+        Cfg.Enabled = not Cfg.Enabled
+        refreshGui()
+    end)
+
+        rangeLabel = label("", 62, 11, false)
+     -- Deslizador (ratón y táctil)
+    local trackBar = Instance.new("Frame")
+    trackBar.Position = UDim2.fromOffset(10, 90)
+    trackBar.Size = UDim2.fromOffset(170, 8)
+    trackBar.BackgroundColor3 = Color3.fromRGB(75, 78, 95)
+    trackBar.BorderSizePixel = 0
+    trackBar.Parent = panel
+    Instance.new("UICorner", trackBar)
+
+    fill = Instance.new("Frame")
+    fill.BackgroundColor3 = Color3.fromRGB(70, 130, 255)
+    fill.BorderSizePixel = 0
+    fill.Parent = trackBar
+    Instance.new("UICorner", fill)
+
+    knob = Instance.new("Frame")
+    knob.AnchorPoint = Vector2.new(0.5, 0.5)
+    knob.Size = UDim2.fromOffset(16, 16)
+    knob.BackgroundColor3 = Color3.new(1, 1, 1)
+    knob.BorderSizePixel = 0
+    knob.Parent = trackBar
+    Instance.new("UICorner", knob)
+
+    statusLabel = label("", 104, 10, false)
+    statusLabel.TextColor3 = Color3.fromRGB(150, 155, 175)
+
+    local dragging = false
+    local function fromX(x)
+        local a = math.clamp((x - trackBar.AbsolutePosition.X) / trackBar.AbsoluteSize.X, 0, 1)
+        setMaxDistance(Cfg.SliderMin + a * (Cfg.SliderMax - Cfg.SliderMin))
+    end
+    trackBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            fromX(input.Position.X)
+        end
+    end)
+    track(UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            fromX(input.Position.X)
+        end
     end))
-end
-local function addButton(text, cb, accent)
-    local r = corner(mk("TextButton", { Text = text, Font = Enum.Font.GothamBold, TextSize = 13,
-        TextColor3 = C.txt, BackgroundColor3 = accent and C.acc or C.card, AutoButtonColor = false,
-        Size = UDim2.new(1,-4,0,34) }, scroll), 8)
-    link(r.Activated:Connect(function() pcall(cb) end))
-end
+    track(UIS.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
 
-addToggle("Auto Steal", "autosteal")
-addToggle("Cámara al balón", "cam")
-addToggle("Anti-Ragdoll", "antiragg")
+    setMaxDistance(Cfg.MaxDistance)
+    refreshGui()
 
--- botón ciclar cámara
-local camBtn = corner(mk("TextButton", { Text = "", Font = Enum.Font.GothamBold, TextSize = 12,
-    TextColor3 = C.txt, BackgroundColor3 = C.card, AutoButtonColor = false,
-    Size = UDim2.new(1,-4,0,30) }, scroll), 8)
-local function camTxt() camBtn.Text = "📷  Fuerza cámara: "..math.floor(K.pulls[cfg.pull]*100).."%" end
-camTxt()
-link(camBtn.Activated:Connect(function()
-    cfg.pull = cfg.pull % #K.pulls + 1; camTxt(); save(); say("Cámara "..math.floor(K.pulls[cfg.pull]*100).."%", C.acc)
-end))
-
-addButton("🏃  Grab Ball  (G)", grab, true)
-
--- hotkey G
-link(UIS.InputBegan:Connect(function(i, gp)
-    if gp then return end
-    if i.KeyCode == K.grabKey then pcall(grab) end
-end))
-
---== UNLOAD ==----------------------------------------------------------
-local function unload()
-    for _, c in ipairs(cons) do pcall(function() c:Disconnect() end) end
-    for _, f in pairs(Features) do
-        for _, c in ipairs(f.connections or {}) do pcall(function() c:Disconnect() end) end
+    -- Montaje: PlayerGui primero; si falla, gethui/CoreGui
+    local parent = LP:FindFirstChild("PlayerGui") or LP:WaitForChild("PlayerGui", 5)
+    if not (parent and pcall(function() gui.Parent = parent end)) then
+        pcall(function() gui.Parent = gethui and gethui() or getService("CoreGui") end)
     end
-    setCam(false)
-    stopAntiRag()
-    pcall(function() gui:Destroy() end)
-    ENV.HUB = nil
-    print("[Hub] descargado")
 end
-local xb = corner(mk("TextButton", { Text = "✕", Font = Enum.Font.GothamBold, TextSize = 13,
-    TextColor3 = C.mut, BackgroundColor3 = C.card, Size = UDim2.fromOffset(26,22),
-    Position = UDim2.new(1,-34,0,4) }, head), 6)
-link(xb.Activated:Connect(unload))
 
-local parent
-if gethui then local ok, h = pcall(gethui); if ok and h then parent = h end end
-if not parent then local ok, cg = pcall(function() return game:GetService("CoreGui") end); if ok and cg then parent = cg end end
-if not parent then parent = me:WaitForChild("PlayerGui") end
-gui.Parent = parent
+--==========================================================================
+-- 10. CONEXIONES, ARRANQUE Y LIMPIEZA
+--==========================================================================
+scanGoals()
+track(Workspace.DescendantAdded:Connect(function(d) pcall(considerGoal, d) end))
+track(Workspace.DescendantRemoving:Connect(function(d)
+    if goals[d] then goals[d] = nil boundsCache[d] = nil end
+end))
 
-ENV.HUB = { unload = unload, toggle = toggleFeature, features = Features, grab = grab }
-print("[Hub] listo · Anti-Ragdoll incluido")
+local guiTimer = 0
+track(RunService.Heartbeat:Connect(function(dt)
+    if not running then return end
+    step()
+    guiTimer = guiTimer + dt
+    if guiTimer > 0.2 then guiTimer = 0 refreshGui() end
+end))
+
+track(UIS.InputBegan:Connect(function(input) pcall(onInput, input) end))
+
+-- Si el personaje muere o se reinicia, se limpia el estado del tiro
+track(LP.CharacterRemoving:Connect(function()
+    State.ready, State.preset, State.shotPoint, State.root = false, nil, nil, nil
+end))
+
+hooked = installHook()
+if not hooked then
+    warn("[AutoAim] tu ejecutor no soporta hookmetamethod: solo funciona la alternativa por cámara.")
+end
+
+if Cfg.ShowGui then
+    local ok, err = pcall(buildGui)
+    if not ok then warn("[AutoAim] error al crear la GUI:", err) end
+end
+
+-- Apagado: desconecta todo. El hook queda como paso directo (running = false)
+function Cfg.stop()
+    running = false
+    Cfg.Enabled = false
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    if gui then pcall(function() gui:Destroy() end) end
+    print("[AutoAim] detenido")
+end
+
+print("[AutoAim] v1 cargado · hook: " .. (hooked and "sí" or "no"))
