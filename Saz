@@ -1,0 +1,479 @@
+--[[
+    BLUE SCAN — busca en el juego lo necesario para arreglar el Auto Aim y lo muestra EN PANTALLA
+    (no usa la consola). Solo lee: no cambia nada del juego.
+
+    Qué hace: revisa tu ejecutor, tus Values, las porterías, los remotos, el balón y LEE EL CÓDIGO
+    del juego buscando cómo se dispara el tiro. Además tiene un espía que anota el tiro que hagas.
+    Botones: ◀ ▶ cambian de página | Copiar | Espía/Escaneo | X cierra.
+    Si no se puede copiar: toca el texto, mantén y "Seleccionar todo", o haz una captura de pantalla.
+]]
+
+local function svc(n)
+    local ok, s = pcall(function() return game:GetService(n) end)
+    return ok and s or nil
+end
+local Players, RS, WS, RunService = svc("Players"), svc("ReplicatedStorage"), svc("Workspace"), svc("RunService")
+local LP = Players and Players.LocalPlayer
+if not (Players and RS and WS and RunService and LP) then return end
+
+if getgenv().BlueScan and getgenv().BlueScan.close then pcall(getgenv().BlueScan.close) end
+local Scan = {}
+getgenv().BlueScan = Scan
+
+local MAX_PAGE = 6000          -- caracteres por página (el texto largo no cabe en una sola etiqueta)
+local MAX_SCRIPTS = 160        -- máximo de scripts del juego que se leen
+local MAX_SECONDS = 35         -- tiempo máximo leyendo código
+local scanLines, spyLines = {}, {}
+local pages, pageIdx, view = { "" }, 1, "scan"
+local gui, box, statusLabel, pageLabel, viewBtn
+local conns, closed, spyDirty = {}, false, false
+
+--==========================================================================
+-- Utilidades
+--==========================================================================
+local function clip(s, n)
+    n = n or 200
+    s = tostring(s)
+    if #s > n then return string.sub(s, 1, n) .. "..." end
+    return s
+end
+local function add(s) scanLines[#scanLines + 1] = clip(s) end
+local function head(t) add("") add("=== " .. t .. " ===") end
+local function yn(b) return b and "sí" or "NO" end
+local function trim(s) return (string.gsub(s, "^%s+", "")) end
+local function show(a)
+    local t = typeof(a)
+    if t == "table" then
+        local n = 0
+        for _ in pairs(a) do n = n + 1 end
+        return "table(" .. n .. ")"
+    end
+    return t .. ":" .. tostring(a)
+end
+local function valueOf(inst)
+    local ok, v = pcall(function() return inst.Value end)
+    return ok and tostring(v) or "-"
+end
+
+-- Reparte las líneas en páginas que no pasen de maxChars (cortando entre líneas)
+local function paginate(lines, maxChars)
+    local out, cur, len = {}, {}, 0
+    for _, l in ipairs(lines) do
+        if len + #l + 1 > maxChars and #cur > 0 then
+            out[#out + 1] = table.concat(cur, "\n")
+            cur, len = {}, 0
+        end
+        cur[#cur + 1] = l
+        len = len + #l + 1
+    end
+    if #cur > 0 then out[#out + 1] = table.concat(cur, "\n") end
+    if #out == 0 then out[1] = "" end
+    return out
+end
+
+-- Busca en el código fuente líneas que mencionan "shoot" junto a Fire/Invoke, con contexto
+local function searchSource(src, name, out, maxHits)
+    local lines = {}
+    for l in string.gmatch(src, "[^\n]+") do lines[#lines + 1] = l end
+    local hits = 0
+    for i, l in ipairs(lines) do
+        local low = string.lower(l)
+        if string.find(low, "shoot", 1, true) and (string.find(low, "fire", 1, true) or string.find(low, "invoke", 1, true)) then
+            out[#out + 1] = "  [" .. name .. ":" .. i .. "]"
+            for j = math.max(1, i - 1), math.min(#lines, i + 2) do
+                out[#out + 1] = "      " .. clip(trim(lines[j]), 150)
+            end
+            hits = hits + 1
+            if hits >= maxHits then break end
+        end
+    end
+    return hits
+end
+
+--==========================================================================
+-- Escaneo
+--==========================================================================
+local function setStatus(t) if statusLabel then statusLabel.Text = t end end
+
+local function scanExecutor()
+    head("1) EJECUTOR")
+    add("hook: hookmetamethod " .. yn(hookmetamethod) .. " | getnamecallmethod " .. yn(getnamecallmethod)
+        .. " | newcclosure " .. yn(newcclosure) .. " | hookfunction " .. yn(hookfunction))
+    add("leer código: getscripts " .. yn(getscripts) .. " | getloadedmodules " .. yn(getloadedmodules)
+        .. " | decompile " .. yn(decompile) .. " | getgc " .. yn(getgc)
+        .. " | getconstants " .. yn(debug and debug.getconstants))
+    add("otros: setclipboard " .. yn(setclipboard) .. " | writefile " .. yn(writefile) .. " | firetouchinterest " .. yn(firetouchinterest))
+end
+
+local function scanCharacter()
+    head("2) TU PERSONAJE (Values)")
+    local char = LP.Character
+    local vals = char and char:FindFirstChild("Values")
+    if not vals then add("no hay carpeta Values en tu personaje") return end
+    for _, v in ipairs(vals:GetChildren()) do
+        add("Values." .. v.Name .. " = " .. valueOf(v) .. " (" .. v.ClassName .. ")")
+    end
+end
+
+local function scanGoals()
+    head("3) POSIBLES PORTERÍAS")
+    local char = LP.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local keys = { "goal", "rim", "net", "arco", "porteria", "post" }
+    local found = 0
+    local list = WS:GetDescendants()
+    for i, d in ipairs(list) do
+        if d:IsA("BasePart") or d:IsA("Model") then
+            local n = string.lower(d.Name)
+            for _, k in ipairs(keys) do
+                if string.find(n, k, 1, true) then
+                    local isModel = d:IsA("Model")
+                    local okS, size = pcall(function() return isModel and d:GetExtentsSize() or d.Size end)
+                    local okP, pos = pcall(function() return isModel and d:GetPivot().Position or d.Position end)
+                    if okS and okP then
+                        local dist = root and (pos - root.Position).Magnitude or -1
+                        add(string.format("%s | %s | %.0fx%.0fx%.0f | a %.0f st", d:GetFullName(), d.ClassName, size.X, size.Y, size.Z, dist))
+                        found = found + 1
+                    end
+                    break
+                end
+            end
+        end
+        if found >= 30 then add("(hay más; se omiten)") break end
+        if i % 3000 == 0 then task.wait() end
+    end
+    if found == 0 then add("no encontré ninguna") end
+end
+
+local function scanRemotes()
+    head("4) REMOTOS DEL BALÓN / TIRO")
+    local count = 0
+    local function scan(container)
+        for i, d in ipairs(container:GetDescendants()) do
+            if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+                local full = d:GetFullName()
+                local low = string.lower(full)
+                if string.find(low, "ballservice", 1, true) or string.find(low, "shoot", 1, true)
+                    or string.find(low, "shot", 1, true) or string.find(low, "kick", 1, true) then
+                    add(full .. " (" .. d.ClassName .. ")")
+                    count = count + 1
+                    if count >= 50 then return true end
+                end
+            end
+            if i % 3000 == 0 then task.wait() end
+        end
+    end
+    if not scan(RS) then scan(WS) end
+    if count == 0 then add("no encontré ninguno") end
+end
+
+local function scanBall()
+    head("5) EL BALÓN")
+    local ball = WS:FindFirstChild("Football") or WS:FindFirstChild("Football", true)
+    if not ball then add("no encontré 'Football' en el mapa") return end
+    add(ball:GetFullName() .. " (" .. ball.ClassName .. ")")
+    for k, v in pairs(ball:GetAttributes()) do add("atributo: " .. tostring(k) .. " = " .. tostring(v)) end
+    for _, c in ipairs(ball:GetChildren()) do add("hijo: " .. c.ClassName .. " " .. c.Name) end
+end
+
+-- Lee el código del juego (LocalScripts/ModuleScripts) buscando cómo se envía el tiro
+local function scanCode()
+    head("6) CÓDIGO DEL JUEGO QUE ENVÍA EL TIRO")
+    local pool, seen = {}, {}
+    local function collect(list)
+        for _, s in ipairs(list or {}) do
+            if not seen[s] then seen[s] = true pool[#pool + 1] = s end
+        end
+    end
+    if getscripts then pcall(function() collect(getscripts()) end) end
+    if getloadedmodules then pcall(function() collect(getloadedmodules()) end) end
+
+    local mine = {}
+    for _, s in ipairs(pool) do
+        local ok, rel = pcall(function()
+            return (s:IsA("LocalScript") or s:IsA("ModuleScript"))
+                and (s:IsDescendantOf(LP) or s:IsDescendantOf(RS) or s:IsDescendantOf(WS))
+        end)
+        if ok and rel then mine[#mine + 1] = s end
+    end
+
+    if decompile and #mine > 0 then
+        local t0, hitsTotal, readCount = os.clock(), 0, 0
+        for i, s in ipairs(mine) do
+            if i > MAX_SCRIPTS or os.clock() - t0 > MAX_SECONDS or closed then
+                add("(lectura detenida en el script " .. i .. " de " .. #mine .. ")")
+                break
+            end
+            setStatus("Leyendo scripts " .. i .. "/" .. #mine .. "...")
+            local ok, src = pcall(decompile, s)
+            if ok and type(src) == "string" then
+                readCount = readCount + 1
+                local out = {}
+                local n = searchSource(src, s:GetFullName(), out, 4)
+                if n > 0 then
+                    for _, l in ipairs(out) do add(l) end
+                    hitsTotal = hitsTotal + n
+                end
+            end
+            if hitsTotal >= 20 then add("(suficientes resultados; se detiene)") break end
+            if i % 4 == 0 then task.wait() end
+        end
+        add("scripts leídos: " .. readCount .. " | coincidencias: " .. hitsTotal)
+        if hitsTotal == 0 then add("ningún script mencionó 'shoot' junto a Fire/Invoke") end
+    elseif getgc and debug and debug.getconstants then
+        add("sin decompile: se buscan funciones del juego cuyas constantes incluyan 'Shoot' y 'FireServer'")
+        local n, i = 0, 0
+        for _, f in ipairs(getgc(true)) do
+            i = i + 1
+            if i % 2000 == 0 then task.wait() setStatus("Revisando funciones... " .. i) end
+            if type(f) == "function" and (not islclosure or islclosure(f)) then
+                local ok, consts = pcall(debug.getconstants, f)
+                if ok and type(consts) == "table" then
+                    local hasShoot, hasFire = false, false
+                    for _, c in pairs(consts) do
+                        if type(c) == "string" then
+                            local low = string.lower(c)
+                            if low == "shoot" or low == "shoot_event" then hasShoot = true end
+                            if c == "FireServer" or c == "Fire" or c == "InvokeServer" then hasFire = true end
+                        end
+                    end
+                    if hasShoot and hasFire then
+                        n = n + 1
+                        local okI, info = pcall(debug.getinfo, f)
+                        local list = {}
+                        for _, c in pairs(consts) do
+                            if type(c) == "string" or type(c) == "number" or type(c) == "boolean" then list[#list + 1] = tostring(c) end
+                        end
+                        add("  función en " .. (okI and info and tostring(info.short_src or info.source) or "?")
+                            .. ":" .. (okI and info and tostring(info.linedefined) or "?"))
+                        add("      constantes: " .. table.concat(list, ", "))
+                        if n >= 10 then break end
+                    end
+                end
+            end
+        end
+        if n == 0 then add("no encontré funciones con esas constantes") end
+    else
+        add("tu ejecutor no permite leer el código del juego (sin getscripts/decompile/getgc)")
+    end
+end
+
+--==========================================================================
+-- Espía: anota el tiro que hagas (nombre del remoto y argumentos exactos)
+--==========================================================================
+local function installSpy()
+    getgenv().BlueScanSpyOn = true
+    if not (hookmetamethod and getnamecallmethod) then
+        spyLines[#spyLines + 1] = "Tu ejecutor NO soporta hookmetamethod: el espía no puede funcionar."
+        spyLines[#spyLines + 1] = "Mira la sección 6 del escaneo: ahí está cómo el juego envía el tiro."
+        return
+    end
+    if getgenv().BlueScanSpyInstalled then return end
+    getgenv().BlueScanSpyInstalled = true
+    local counts = {}
+    local function pathOf(inst)
+        local parts, cur = {}, inst
+        for _ = 1, 8 do
+            if not cur then break end
+            table.insert(parts, 1, cur.Name)
+            cur = cur.Parent
+        end
+        return table.concat(parts, ".")
+    end
+    local old
+    local function handler(self, ...)
+        local m = getnamecallmethod()
+        if getgenv().BlueScanSpyOn and (m == "FireServer" or m == "InvokeServer") and typeof(self) == "Instance" then
+            local path = pathOf(self)
+            local low = string.lower(path)
+            if string.find(low, "ballservice", 1, true) or string.find(low, "shoot", 1, true)
+                or string.find(low, "shot", 1, true) or string.find(low, "kick", 1, true) then
+                counts[path] = (counts[path] or 0) + 1
+                if counts[path] <= 8 then
+                    local args = table.pack(...)
+                    local out = {}
+                    for i = 1, args.n do out[i] = show(args[i]) end
+                    spyLines[#spyLines + 1] = clip(path .. " :" .. m .. "(" .. table.concat(out, ", ") .. ")", 400)
+                    spyDirty = true
+                end
+            end
+        end
+        return old(self, ...)
+    end
+    old = hookmetamethod(game, "__namecall", newcclosure and newcclosure(handler) or handler)
+    spyLines[#spyLines + 1] = "Espía activo. Haz UN tiro normal con el balón y vuelve aquí."
+end
+
+--==========================================================================
+-- Texto, copia y panel
+--==========================================================================
+function Scan.text()
+    local all = {}
+    for _, l in ipairs(scanLines) do all[#all + 1] = l end
+    all[#all + 1] = ""
+    all[#all + 1] = "=== ESPÍA DEL TIRO ==="
+    for _, l in ipairs(spyLines) do all[#all + 1] = l end
+    return table.concat(all, "\n")
+end
+
+function Scan.copy()
+    local text = Scan.text()
+    pcall(function() if writefile then writefile("bluescan.txt", text) end end)
+    if setclipboard then
+        local ok = pcall(setclipboard, text)
+        setStatus(ok and "Copiado: pégalo en el chat" or "No pude copiar: haz captura")
+    else
+        setStatus("Sin copiar: toca el texto > Seleccionar todo, o haz captura")
+    end
+end
+
+Scan.paginate, Scan.searchSource = paginate, searchSource
+
+local function render()
+    if not box then return end
+    if view == "scan" then
+        pages = paginate(scanLines, MAX_PAGE)
+        pageIdx = math.clamp(pageIdx, 1, #pages)
+        box.Text = pages[pageIdx]
+        pageLabel.Text = "Escaneo " .. pageIdx .. "/" .. #pages
+    else
+        local from = math.max(1, #spyLines - 40)
+        local t = {}
+        for i = from, #spyLines do t[#t + 1] = spyLines[i] end
+        box.Text = table.concat(t, "\n")
+        pageLabel.Text = "Espía"
+    end
+    viewBtn.Text = view == "scan" and "Espía" or "Escaneo"
+end
+
+local function buildGui()
+    gui = Instance.new("ScreenGui")
+    gui.Name = "BlueScan"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 1000
+
+    local frame = Instance.new("Frame")
+    frame.AnchorPoint = Vector2.new(0.5, 0.5)
+    frame.Position = UDim2.new(0.5, 0, 0.5, 0)
+    frame.Size = UDim2.new(0.96, 0, 0.78, 0)
+    frame.BackgroundColor3 = Color3.fromRGB(18, 20, 28)
+    frame.BorderSizePixel = 0
+    frame.Parent = gui
+
+    statusLabel = Instance.new("TextLabel")
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Position = UDim2.fromOffset(8, 4)
+    statusLabel.Size = UDim2.new(1, -16, 0, 20)
+    statusLabel.Font = Enum.Font.GothamBold
+    statusLabel.TextSize = 12
+    statusLabel.TextColor3 = Color3.fromRGB(110, 200, 255)
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.Text = "Escaneando..."
+    statusLabel.Parent = frame
+
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Position = UDim2.fromOffset(6, 28)
+    scroll.Size = UDim2.new(1, -12, 1, -70)
+    scroll.BackgroundColor3 = Color3.fromRGB(10, 12, 18)
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 6
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.Parent = frame
+
+    box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, -8, 0, 0)
+    box.AutomaticSize = Enum.AutomaticSize.Y
+    box.BackgroundTransparency = 1
+    box.MultiLine = true
+    box.TextWrapped = true
+    box.ClearTextOnFocus = false
+    box.TextEditable = true
+    box.Font = Enum.Font.Code
+    box.TextSize = 11
+    box.TextColor3 = Color3.fromRGB(225, 230, 240)
+    box.TextXAlignment = Enum.TextXAlignment.Left
+    box.TextYAlignment = Enum.TextYAlignment.Top
+    box.Text = ""
+    box.Parent = scroll
+
+    pageLabel = Instance.new("TextLabel")
+    pageLabel.BackgroundTransparency = 1
+    pageLabel.AnchorPoint = Vector2.new(0, 1)
+    pageLabel.Position = UDim2.new(0, 8, 1, -36)
+    pageLabel.Size = UDim2.fromOffset(150, 14)
+    pageLabel.Font = Enum.Font.Gotham
+    pageLabel.TextSize = 10
+    pageLabel.TextColor3 = Color3.fromRGB(150, 155, 175)
+    pageLabel.TextXAlignment = Enum.TextXAlignment.Left
+    pageLabel.Parent = frame
+
+    local function button(text, order, fn)
+        local b = Instance.new("TextButton")
+        b.AnchorPoint = Vector2.new(0, 1)
+        b.Position = UDim2.new((order - 1) / 5, 6, 1, -6)
+        b.Size = UDim2.new(0.2, -6, 0, 28)
+        b.BackgroundColor3 = Color3.fromRGB(45, 50, 70)
+        b.TextColor3 = Color3.new(1, 1, 1)
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 12
+        b.Text = text
+        b.AutoButtonColor = true
+        b.Parent = frame
+        b.Activated:Connect(fn)
+        return b
+    end
+    button("◀", 1, function() if view == "scan" then pageIdx = math.max(1, pageIdx - 1) render() end end)
+    button("▶", 2, function() if view == "scan" then pageIdx = math.min(#pages, pageIdx + 1) render() end end)
+    button("Copiar", 3, Scan.copy)
+    viewBtn = button("Espía", 4, function() view = view == "scan" and "spy" or "scan" render() end)
+    button("X", 5, function() Scan.close() end)
+
+    local parent = LP:FindFirstChild("PlayerGui") or LP:WaitForChild("PlayerGui", 5)
+    if not (parent and pcall(function() gui.Parent = parent end)) then
+        pcall(function() gui.Parent = gethui and gethui() or svc("CoreGui") end)
+    end
+end
+
+function Scan.close()
+    if closed then return end
+    closed = true
+    getgenv().BlueScanSpyOn = false
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    if gui then pcall(function() gui:Destroy() end) end
+end
+
+--==========================================================================
+-- Arranque
+--==========================================================================
+local okGui, errGui = pcall(buildGui)
+if not okGui then
+    warn("[BlueScan] no pude crear el panel: " .. tostring(errGui))
+end
+
+conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+    if spyDirty then
+        spyDirty = false
+        if view == "spy" then render() end
+    end
+end)
+
+task.spawn(function()
+    local steps = {
+        { "Revisando ejecutor...", scanExecutor }, { "Revisando tu personaje...", scanCharacter },
+        { "Buscando porterías...", scanGoals }, { "Buscando remotos...", scanRemotes },
+        { "Revisando el balón...", scanBall }, { "Leyendo el código del juego...", scanCode },
+    }
+    for _, st in ipairs(steps) do
+        if closed then return end
+        setStatus(st[1])
+        local ok, err = pcall(st[2])
+        if not ok then add("(error en este paso: " .. clip(err, 120) .. ")") end
+        render()
+        task.wait()
+    end
+    installSpy()
+    setStatus("Listo. Haz UN tiro normal y toca 'Espía'. Luego 'Copiar' o haz captura.")
+    render()
+end)
