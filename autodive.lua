@@ -3,6 +3,32 @@
 -- =====================================================
 
 local Players = game:GetService("Players")
+-- =====================================================
+-- AUTO DRIBBLE v2 — regatea solo cuando un rival se lanza
+-- =====================================================
+local function startAutoDribble()
+    -- ⬇️ PEGA AQUÍ TODO EL SCRIPT DE AUTO DRIBBLE v2 (el que me pasaste) ⬇️
+    -- Nada más. Empieza desde "local Players = game:GetService("Players")"
+    -- hasta "print("[AutoDribble] v2 cargado · modo " .. Cfg.Mode)"
+    -- ⬆️ FIN DEL PEGADO ⬆️
+end
+
+local function stopAutoDribble()
+    if getgenv().AutoDribble and getgenv().AutoDribble.stop then
+        pcall(getgenv().AutoDribble.stop)
+    end
+end
+
+makeCard("Auto Dribble", "Regatea solo vs rivales que se lanzan", "⚽", function(on)
+    if on then
+        startAutoDribble()
+        notify("Auto Dribble activado", C.Green)
+    else
+        stopAutoDribble()
+        notify("Auto Dribble desactivado", C.Red)
+    end
+end)
+print("[AutoDribble] v2 cargado · modo " .. Cfg.Mode .. " (Nova Hub)")
 local UIS = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
@@ -290,16 +316,21 @@ end
 
 -- Minimizar
 minBtn.Activated:Connect(function()
-    local minimized = win.Size.Y.Offset == 48
-    local targetSize = minimized and UDim2.fromOffset(360, 460) or UDim2.fromOffset(360, 48)
-    content.Visible = not (not minimized)
+    local isMin = win.Size.Y.Offset == 48   -- ¿está minimizada ANTES del click?
+    local targetSize = isMin and UDim2.fromOffset(360, 460) or UDim2.fromOffset(360, 48)
+
+    -- si estaba minimizada → restauramos (visible = true)
+    -- si estaba abierta    → minimizamos (visible = false)
+    content.Visible = isMin
+
+    -- separador y footer se ocultan junto al contenido
     for _, c in ipairs(win:GetChildren()) do
-        if c:IsA("Frame") and c.Size.Y.Offset == 1 then
-            c.Visible = not minimized and c.Position.Y.Offset ~= 48 and c.Visible or (not minimized)
+        if c ~= header and c ~= content and (c.Size.Y.Offset == 1 or c:IsA("TextLabel")) then
+            c.Visible = isMin
         end
     end
+
     TweenService:Create(win, TweenInfo.new(0.25, Enum.EasingStyle.Quad), { Size = targetSize }):Play()
-    content.Visible = not minimized
 end)
 
 -- Cerrar
