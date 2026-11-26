@@ -3,32 +3,6 @@
 -- =====================================================
 
 local Players = game:GetService("Players")
--- =====================================================
--- AUTO DRIBBLE v2 — regatea solo cuando un rival se lanza
--- =====================================================
-local function startAutoDribble()
-    -- ⬇️ PEGA AQUÍ TODO EL SCRIPT DE AUTO DRIBBLE v2 (el que me pasaste) ⬇️
-    -- Nada más. Empieza desde "local Players = game:GetService("Players")"
-    -- hasta "print("[AutoDribble] v2 cargado · modo " .. Cfg.Mode)"
-    -- ⬆️ FIN DEL PEGADO ⬆️
-end
-
-local function stopAutoDribble()
-    if getgenv().AutoDribble and getgenv().AutoDribble.stop then
-        pcall(getgenv().AutoDribble.stop)
-    end
-end
-
-makeCard("Auto Dribble", "Regatea solo vs rivales que se lanzan", "⚽", function(on)
-    if on then
-        startAutoDribble()
-        notify("Auto Dribble activado", C.Green)
-    else
-        stopAutoDribble()
-        notify("Auto Dribble desactivado", C.Red)
-    end
-end)
-print("[AutoDribble] v2 cargado · modo " .. Cfg.Mode .. " (Nova Hub)")
 local UIS = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
@@ -695,6 +669,455 @@ makeCard("Auto Dive", "Blue Lock: Rivals · atajadas automáticas", "🎯", func
         notify("Auto Dive desactivado", C.Red)
     end
 end)
+--[[
+    AUTO DRIBBLE v2 — regatea solo cuando un rival se te lanza con Sliding
+    Basado en el script original (mismos remoto, animaciones y valores del juego), con mejoras:
+      - Solo reacciona a rivales que SE ACERCAN a ti (no a cualquiera que esté en rango).
+      - Dispara una vez por amenaza (con cooldown); el original llamaba al remoto en cada frame.
+      - Elige la amenaza más inminente, no la primera de la lista.
+      - Cachea las animaciones y no se rompe si falta algún valor del juego.
+      - Si no hay equipos definidos, trata a todos como rivales (el original no hacía nada).
+    Config compatible: getgenv().AutoDribbleSettings.Enabled / .range
+    API: getgenv().AutoDribble.stop()
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local RS = game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+-- Apaga la copia anterior (este script o el original) antes de empezar
+if getgenv().AutoDribble and getgenv().AutoDribble.stop then
+    pcall(getgenv().AutoDribble.stop)
+end
+
+local Cfg = {
+    Enabled = true,
+    range = 30,               -- distancia máxima del rival (studs), como en el original
+
+    Mode = "smart",           -- "smart" = solo rivales que se acercan | "classic" = como el original
+    LeadTime = 0.6,           -- smart: regatea cuando el rival llega en menos de X segundos
+    NearDistance = 10,        -- smart: o cuando está más cerca que esto (y se acerca)
+    MinClosing = 6,           -- smart: velocidad mínima de acercamiento (studs/s)
+    Cooldown = 0.6,           -- segundos mínimos entre regates
+
+    SnapBall = true,          -- como el original: pega el balón bajo tus pies al regatear
+    SnapMaxDistance = 15,     -- ...pero solo si el balón está a esta distancia o menos
+    IgnoreTeammates = true,
+    WalkSpeedFallback = true, -- detecta "sliding" también por WalkSpeed 0 + movimiento (como el original)
+    AnimationCheck = true,    -- y por la animación (nombre que contiene SlideAnim)
+    SlideAnim = "slid",
+    Debug = false,
+}
+-- Conserva los ajustes del script original si ya existían
+local old = getgenv().AutoDribbleSettings
+if type(old) == "table" then
+    for k, v in pairs(old) do if Cfg[k] ~= nil then Cfg[k] = v end end
+end
+getgenv().AutoDribbleSettings = Cfg
+getgenv().AutoDribble = Cfg
+
+local running = true
+local conns = {}
+local char, root, humanoid
+local remote, Anims
+local trackCache = {}
+local lastFire, warned = 0, {}
+local samples = {}            -- [Player] = { pos, t } para estimar velocidad
+
+local function track(c) conns[#conns + 1] = c return c end
+local function warnOnce(key, msg)
+    if not warned[key] then warned[key] = true warn("[AutoDribble] " .. msg) end
+end
+
+-- Recursos del juego (sin bloquear: si faltan, el script avisa y no hace nada)
+task.spawn(function()
+    local ok, r = pcall(function()
+        return RS:WaitForChild("Packages", 10):WaitForChild("Knit", 10):WaitForChild("Services", 10)
+            :WaitForChild("BallService", 10):WaitForChild("RE", 10):WaitForChild("Dribble", 10)
+    end)
+    if ok and r then remote = r else warnOnce("remote", "no encontré el remoto Dribble del juego") end
+
+    local okA, mod = pcall(function() return require(RS:WaitForChild("Assets", 10):WaitForChild("Animations", 10)) end)
+    if okA then Anims = mod else warnOnce("anims", "no pude cargar las animaciones del juego (se regatea sin animación)") end
+end)
+
+local function bind(c)
+    char = c
+    root = c:WaitForChild("HumanoidRootPart", 10)
+    humanoid = c:WaitForChild("Humanoid", 10)
+    trackCache = {}
+end
+if LP.Character then task.spawn(bind, LP.Character) end
+track(LP.CharacterAdded:Connect(bind))
+
+-- ¿Tengo el balón? (Values.HasBall del personaje)
+local function hasBall()
+    local vals = char and char:FindFirstChild("Values")
+    local hb = vals and vals:FindFirstChild("HasBall")
+    return hb ~= nil and hb.Value == true
+end
+
+local function isOpponent(p)
+    if p == LP then return false end
+    if not Cfg.IgnoreTeammates then return true end
+    if LP.Team and p.Team then return LP.Team ~= p.Team end
+    return true                -- sin equipos definidos: todos son rivales
+end
+
+-- ¿Está haciendo Sliding? Valor del juego, animación o heurística del original
+local function isSliding(p, c)
+    local vals = c:FindFirstChild("Values")
+    local v = vals and vals:FindFirstChild("Sliding")
+    if v and v.Value == true then return true end
+
+    local hum = c:FindFirstChildOfClass("Humanoid")
+    if Cfg.AnimationCheck and hum then
+        local animator = hum:FindFirstChildOfClass("Animator")
+        if animator then
+            for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+                local n = string.lower(t.Name .. " " .. (t.Animation and t.Animation.Name or ""))
+                if string.find(n, Cfg.SlideAnim, 1, true) then return true end
+            end
+        end
+    end
+    if Cfg.WalkSpeedFallback and hum then
+        return hum.MoveDirection.Magnitude > 0 and hum.WalkSpeed == 0
+    end
+    return false
+end
+
+-- Velocidad del rival: la del motor, o estimada con su posición si el motor no la da
+local function velocityOf(p, r, now)
+    local v = r.AssemblyLinearVelocity
+    local s = samples[p]
+    local est = Vector3.new(0, 0, 0)
+    if s and now > s.t then est = (r.Position - s.pos) / (now - s.t) end
+    samples[p] = { pos = r.Position, t = now }
+    return v.Magnitude >= est.Magnitude and v or est
+end
+
+-- Toma la posición/velocidad de todos los rivales en cada frame (hace falta para estimar la velocidad)
+local function sampleOpponents(now)
+    local list = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if isOpponent(p) then
+            local c = p.Character
+            local r = c and c:FindFirstChild("HumanoidRootPart")
+            if r then list[#list + 1] = { p = p, c = c, r = r, v = velocityOf(p, r, now) } end
+        end
+    end
+    return list
+end
+
+-- Evalúa a un rival: devuelve { dist, closing, t } o nil si no es una amenaza
+local function threatOf(e)
+    local offset = root.Position - e.r.Position
+    local dist = offset.Magnitude
+    if dist > Cfg.range or dist < 0.05 then return nil end
+    if not isSliding(e.p, e.c) then return nil end
+
+    local dir = offset.Unit
+    local myVel = root.AssemblyLinearVelocity
+    local closing = e.v:Dot(dir) - myVel:Dot(dir)
+    local t = closing > 0.5 and dist / closing or math.huge
+
+    if Cfg.Mode == "smart" then
+        if closing < Cfg.MinClosing then return nil end
+        if t > Cfg.LeadTime and dist > Cfg.NearDistance then return nil end
+    end
+    return { player = e.p, dist = dist, closing = closing, t = t }
+end
+
+local function playAnimation(dist)
+    if not (Anims and Anims.Dribbles and humanoid) then return end
+    local stats = LP:FindFirstChild("PlayerStats")
+    local style = stats and stats:FindFirstChild("Style")
+    style = style and style.Value
+    local id = style and Anims.Dribbles[style]
+    if not id then return end
+
+    local t = trackCache[style]
+    if not t then
+        local a = Instance.new("Animation")
+        a.AnimationId = id
+        local animator = humanoid:FindFirstChildOfClass("Animator") or humanoid
+        t = animator:LoadAnimation(a)
+        trackCache[style] = t
+    end
+    t:Play(0.05, 1, math.clamp(1 + (10 - dist) / 10, 1, 2))
+end
+
+local function snapBall()
+    if not Cfg.SnapBall then return end
+    local f = workspace:FindFirstChild("Football")
+    local ball = f and (f:IsA("BasePart") and f or f:FindFirstChildWhichIsA("BasePart"))
+    if ball and (ball.Position - root.Position).Magnitude <= Cfg.SnapMaxDistance then
+        ball.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        ball.CFrame = root.CFrame * CFrame.new(0, -2.5, 0)
+    end
+end
+
+local function dribble(threat)
+    lastFire = tick()
+    if Cfg.Debug then
+        print(string.format("[AutoDribble] %s a %.1f st, se acerca a %.0f st/s, llega en %.2fs",
+            threat.player.Name, threat.dist, threat.closing, threat.t))
+    end
+    pcall(function() remote:FireServer() end)
+    pcall(playAnimation, threat.dist)
+    pcall(snapBall)
+end
+
+track(RunService.Heartbeat:Connect(function()
+    if not running then return end
+    local now = tick()
+    local opponents = sampleOpponents(now)
+    if not (Cfg.Enabled and remote and char and root and root.Parent) then return end
+    if now - lastFire < Cfg.Cooldown or not hasBall() then return end
+
+    -- la amenaza más inminente (menor tiempo de llegada; a igualdad, la más cercana)
+    local best
+    for _, e in ipairs(opponents) do
+        local th = threatOf(e)
+        if th and (not best or th.t < best.t or (th.t == best.t and th.dist < best.dist)) then best = th end
+    end
+    if best then dribble(best) end
+end))
+
+track(Players.PlayerRemoving:Connect(function(p) samples[p] = nil end))
+
+function Cfg.stop()
+    if not running then return end
+    running = false
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    print("[AutoDribble] detenido")
+end
+-- =====================================================
+-- AUTO DRIBBLE v2 — regatea solo cuando un rival se lanza
+-- =====================================================
+local function startAutoDribble()
+    if getgenv().AutoDribble and getgenv().AutoDribble.stop then
+        pcall(getgenv().AutoDribble.stop)
+    end
+
+    local Players = game:GetService("Players")
+    local RunService = game:GetService("RunService")
+    local RS = game:GetService("ReplicatedStorage")
+    local LP = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+    local Cfg = {
+        Enabled = true,
+        range = 30,
+        Mode = "smart",
+        LeadTime = 0.6,
+        NearDistance = 10,
+        MinClosing = 6,
+        Cooldown = 0.6,
+        SnapBall = true,
+        SnapMaxDistance = 15,
+        IgnoreTeammates = true,
+        WalkSpeedFallback = true,
+        AnimationCheck = true,
+        SlideAnim = "slid",
+        Debug = false,
+    }
+    local old = getgenv().AutoDribbleSettings
+    if type(old) == "table" then
+        for k, v in pairs(old) do if Cfg[k] ~= nil then Cfg[k] = v end end
+    end
+    getgenv().AutoDribbleSettings = Cfg
+    getgenv().AutoDribble = Cfg
+
+    local running = true
+    local conns = {}
+    local char, root, humanoid
+    local remote, Anims
+    local trackCache = {}
+    local lastFire, warned = 0, {}
+    local samples = {}
+
+    local function track(c) conns[#conns + 1] = c return c end
+    local function warnOnce(key, msg)
+        if not warned[key] then warned[key] = true warn("[AutoDribble] " .. msg) end
+    end
+
+    task.spawn(function()
+        local ok, r = pcall(function()
+            return RS:WaitForChild("Packages", 10):WaitForChild("Knit", 10):WaitForChild("Services", 10)
+                :WaitForChild("BallService", 10):WaitForChild("RE", 10):WaitForChild("Dribble", 10)
+        end)
+        if ok and r then remote = r else warnOnce("remote", "no encontré el remoto Dribble del juego") end
+
+        local okA, mod = pcall(function() return require(RS:WaitForChild("Assets", 10):WaitForChild("Animations", 10)) end)
+        if okA then Anims = mod else warnOnce("anims", "no pude cargar las animaciones del juego (se regatea sin animación)") end
+    end)
+
+    local function bind(c)
+        char = c
+        root = c:WaitForChild("HumanoidRootPart", 10)
+        humanoid = c:WaitForChild("Humanoid", 10)
+        trackCache = {}
+    end
+    if LP.Character then task.spawn(bind, LP.Character) end
+    track(LP.CharacterAdded:Connect(bind))
+
+    local function hasBall()
+        local vals = char and char:FindFirstChild("Values")
+        local hb = vals and vals:FindFirstChild("HasBall")
+        return hb ~= nil and hb.Value == true
+    end
+
+    local function isOpponent(p)
+        if p == LP then return false end
+        if not Cfg.IgnoreTeammates then return true end
+        if LP.Team and p.Team then return LP.Team ~= p.Team end
+        return true
+    end
+
+    local function isSliding(p, c)
+        local vals = c:FindFirstChild("Values")
+        local v = vals and vals:FindFirstChild("Sliding")
+        if v and v.Value == true then return true end
+
+        local hum = c:FindFirstChildOfClass("Humanoid")
+        if Cfg.AnimationCheck and hum then
+            local animator = hum:FindFirstChildOfClass("Animator")
+            if animator then
+                for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+                    local n = string.lower(t.Name .. " " .. (t.Animation and t.Animation.Name or ""))
+                    if string.find(n, Cfg.SlideAnim, 1, true) then return true end
+                end
+            end
+        end
+        if Cfg.WalkSpeedFallback and hum then
+            return hum.MoveDirection.Magnitude > 0 and hum.WalkSpeed == 0
+        end
+        return false
+    end
+
+    local function velocityOf(p, r, now)
+        local v = r.AssemblyLinearVelocity
+        local s = samples[p]
+        local est = Vector3.new(0, 0, 0)
+        if s and now > s.t then est = (r.Position - s.pos) / (now - s.t) end
+        samples[p] = { pos = r.Position, t = now }
+        return v.Magnitude >= est.Magnitude and v or est
+    end
+
+    local function sampleOpponents(now)
+        local list = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if isOpponent(p) then
+                local c = p.Character
+                local r = c and c:FindFirstChild("HumanoidRootPart")
+                if r then list[#list + 1] = { p = p, c = c, r = r, v = velocityOf(p, r, now) } end
+            end
+        end
+        return list
+    end
+
+    local function threatOf(e)
+        local offset = root.Position - e.r.Position
+        local dist = offset.Magnitude
+        if dist > Cfg.range or dist < 0.05 then return nil end
+        if not isSliding(e.p, e.c) then return nil end
+
+        local dir = offset.Unit
+        local myVel = root.AssemblyLinearVelocity
+        local closing = e.v:Dot(dir) - myVel:Dot(dir)
+        local t = closing > 0.5 and dist / closing or math.huge
+
+        if Cfg.Mode == "smart" then
+            if closing < Cfg.MinClosing then return nil end
+            if t > Cfg.LeadTime and dist > Cfg.NearDistance then return nil end
+        end
+        return { player = e.p, dist = dist, closing = closing, t = t }
+    end
+
+    local function playAnimation(dist)
+        if not (Anims and Anims.Dribbles and humanoid) then return end
+        local stats = LP:FindFirstChild("PlayerStats")
+        local style = stats and stats:FindFirstChild("Style")
+        style = style and style.Value
+        local id = style and Anims.Dribbles[style]
+        if not id then return end
+
+        local t = trackCache[style]
+        if not t then
+            local a = Instance.new("Animation")
+            a.AnimationId = id
+            local animator = humanoid:FindFirstChildOfClass("Animator") or humanoid
+            t = animator:LoadAnimation(a)
+            trackCache[style] = t
+        end
+        t:Play(0.05, 1, math.clamp(1 + (10 - dist) / 10, 1, 2))
+    end
+
+    local function snapBall()
+        if not Cfg.SnapBall then return end
+        local f = workspace:FindFirstChild("Football")
+        local ball = f and (f:IsA("BasePart") and f or f:FindFirstChildWhichIsA("BasePart"))
+        if ball and (ball.Position - root.Position).Magnitude <= Cfg.SnapMaxDistance then
+            ball.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            ball.CFrame = root.CFrame * CFrame.new(0, -2.5, 0)
+        end
+    end
+
+    local function dribble(threat)
+        lastFire = tick()
+        if Cfg.Debug then
+            print(string.format("[AutoDribble] %s a %.1f st, se acerca a %.0f st/s, llega en %.2fs",
+                threat.player.Name, threat.dist, threat.closing, threat.t))
+        end
+        pcall(function() remote:FireServer() end)
+        pcall(playAnimation, threat.dist)
+        pcall(snapBall)
+    end
+
+    track(RunService.Heartbeat:Connect(function()
+        if not running then return end
+        local now = tick()
+        local opponents = sampleOpponents(now)
+        if not (Cfg.Enabled and remote and char and root and root.Parent) then return end
+        if now - lastFire < Cfg.Cooldown or not hasBall() then return end
+
+        local best
+        for _, e in ipairs(opponents) do
+            local th = threatOf(e)
+            if th and (not best or th.t < best.t or (th.t == best.t and th.dist < best.dist)) then best = th end
+        end
+        if best then dribble(best) end
+    end))
+
+    track(Players.PlayerRemoving:Connect(function(p) samples[p] = nil end))
+
+    function Cfg.stop()
+        if not running then return end
+        running = false
+        for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+        print("[AutoDribble] detenido")
+    end
+
+    print("[AutoDribble] v2 cargado · modo " .. Cfg.Mode .. " (Nova Hub)")
+end
+
+local function stopAutoDribble()
+    if getgenv().AutoDribble and getgenv().AutoDribble.stop then
+        pcall(getgenv().AutoDribble.stop)
+    end
+end
+
+makeCard("Auto Dribble", "Regatea solo vs rivales que se lanzan", "⚽", function(on)
+    if on then
+        startAutoDribble()
+        notify("Auto Dribble activado", C.Green)
+    else
+        stopAutoDribble()
+        notify("Auto Dribble desactivado", C.Red)
+    end
+end)
+
 
 -- ===== Ejemplo: agrega más scripts así =====
 -- makeCard("Speed Hack", "Aumenta tu velocidad", "⚡", function(on)
@@ -706,6 +1129,7 @@ end)
 --         notify("Speed desactivado", C.Red)
 --     end
 -- end)
+
 
 print("[Nova Hub] Cargado ✦")
 notify("Nova Hub v1.0 listo", C.Accent)
